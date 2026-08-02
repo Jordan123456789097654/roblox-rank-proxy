@@ -303,8 +303,8 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
     }
 });
 
-// Interactive Ticket Management Button Endpoint (With Cryptographic Handshake Verification)
-app.post('/discord-interactions', async (req, res) => {
+// Interactive Ticket Management Button Endpoint (Updated to match /api/discord-interactions)
+app.post('/api/discord-interactions', async (req, res) => {
     const signature = req.headers['x-signature-ed25519'];
     const timestamp = req.headers['x-signature-timestamp'];
     const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
