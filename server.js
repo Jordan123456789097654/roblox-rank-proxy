@@ -71,7 +71,16 @@ async function processQueue() {
 // ==========================================
 // Security & Core Middleware
 // ==========================================
-app.use(helmet());
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:"],
+        },
+    },
+}));
 app.use(express.json());
 app.use(rateLimit({
     windowMs: 60 * 1000,
@@ -96,7 +105,6 @@ const authenticateRequest = (req, res, next) => {
     next();
 };
 
-// 🛠️ Global Maintenance Enforcer: Blocks ALL /api/* routes except /api/status, /api/maintenance, and web dashboard
 const blockIfMaintenance = (req, res, next) => {
     if (systemState.maintenanceMode) {
         const allowedPaths = ['/api/status', '/api/maintenance'];
@@ -393,10 +401,10 @@ app.get('/', (req, res) => {
 <body>
     <aside>
         <div class="brand">⚡ Enterprise Engine</div>
-        <ul class="nav-links">
-            <li class="active" onclick="switchView('dashboard')">System Dashboard</li>
-            <li onclick="switchView('moderation')">Discord Moderation Panel</li>
-            <li onclick="switchView('logs')">Live Telemetry Logs</li>
+        <ul class="nav-links" id="navLinks">
+            <li class="active" data-view="dashboard">System Dashboard</li>
+            <li data-view="moderation">Discord Moderation Panel</li>
+            <li data-view="logs">Live Telemetry Logs</li>
         </ul>
     </aside>
     <main>
@@ -404,7 +412,7 @@ app.get('/', (req, res) => {
             <h2 id="view-title">Dashboard Overview</h2>
             <div class="auth-box">
                 <input type="password" id="apiKeyInput" placeholder="Enter Proxy API Key...">
-                <button onclick="refreshData()">Authorize & Sync</button>
+                <button id="syncBtn">Authorize & Sync</button>
             </div>
         </header>
         
@@ -414,7 +422,7 @@ app.get('/', (req, res) => {
                     <h3>Infrastructure Maintenance Switch</h3>
                     <p style="color: var(--text-secondary); font-size: 0.85rem;">Taking services offline stops all rank routes while keeping this dashboard active.</p>
                 </div>
-                <button id="maintBtn" onclick="toggleMaintenance()" style="background-color: var(--warning); color: #000;">Toggle Maintenance Mode</button>
+                <button id="maintBtn" style="background-color: var(--warning); color: #000;">Toggle Maintenance Mode</button>
             </div>
             <div class="grid">
                 <div class="card"><h3>Uptime Status</h3><div class="value" id="stat-uptime">0s</div></div>
@@ -433,8 +441,8 @@ app.get('/', (req, res) => {
                         <input type="text" id="modChannelId" placeholder="e.g. 123456789012345678">
                     </div>
                     <div style="display: flex; gap: 10px; margin-top: 10px;">
-                        <button onclick="executeModAction('rename')">Mark Resolved</button>
-                        <button onclick="executeModAction('delete')" style="background-color: var(--danger);">Purge Channel</button>
+                        <button id="modRenameBtn">Mark Resolved</button>
+                        <button id="modDeleteBtn" style="background-color: var(--danger);">Purge Channel</button>
                     </div>
                 </div>
 
@@ -455,7 +463,7 @@ app.get('/', (req, res) => {
                         <label>Reason / Audit Log Note</label>
                         <input type="text" id="modReason" placeholder="Violation context...">
                     </div>
-                    <button onclick="executeUserModeration()" style="margin-top: 6px; width: 100%;">Execute Action</button>
+                    <button id="execUserModBtn" style="margin-top: 6px; width: 100%;">Execute Action</button>
                 </div>
             </div>
 
@@ -469,7 +477,7 @@ app.get('/', (req, res) => {
                     <label>Message Content / Embed Text</label>
                     <input type="text" id="annContent" placeholder="Type announcement message here...">
                 </div>
-                <button onclick="sendAnnouncement()" style="margin-top: 6px;">Send Announcement</button>
+                <button id="sendAnnBtn" style="margin-top: 6px;">Send Announcement</button>
             </div>
         </div>
 
@@ -485,108 +493,119 @@ app.get('/', (req, res) => {
         </div>
     </main>
     <script>
-        function switchView(viewName) {
-            document.querySelectorAll('.view-container').forEach(el => el.classList.remove('active'));
-            document.querySelectorAll('.nav-links li').forEach(el => el.classList.remove('active'));
-            document.getElementById('view-' + viewName).classList.add('active');
-            event.currentTarget.classList.add('active');
+        document.addEventListener('DOMContentLoaded', () => {
             const titles = { dashboard: 'System Dashboard Overview', moderation: 'Full Discord Moderation Panel', logs: 'Live Telemetry Audit Logs' };
-            document.getElementById('view-title').innerText = titles[viewName];
-        }
 
-        async function refreshData() {
-            const apiKey = document.getElementById('apiKeyInput').value;
-            if (!apiKey) { alert('Please enter your Proxy API Key first.'); return; }
-            try {
-                const response = await fetch('/api/status', { headers: { 'x-api-key': apiKey } });
-                if (!response.ok) throw new Error('Unauthorized or network exception.');
-                const data = await response.json();
-                document.getElementById('stat-uptime').innerText = data.uptimeSeconds + 's';
-                document.getElementById('stat-requests').innerText = data.totalRequestsHandled;
-                document.getElementById('stat-active').innerText = data.activeRankingOperations;
-                
-                const stateEl = document.getElementById('stat-state');
-                if (data.maintenanceMode) {
-                    stateEl.innerText = 'Maintenance ⚠️'; stateEl.style.color = 'var(--warning)';
-                } else if (data.circuitBreakerTripped) {
-                    stateEl.innerText = 'Tripped 🛑'; stateEl.style.color = 'var(--danger)';
-                } else {
-                    stateEl.innerText = 'Optimal ✅'; stateEl.style.color = 'var(--success)';
-                }
-                alert('Dashboard successfully synced with backend engine!');
-            } catch (err) { alert('Sync failed: ' + err.message); }
-        }
-
-        async function toggleMaintenance() {
-            const apiKey = document.getElementById('apiKeyInput').value;
-            if (!apiKey) { alert('Please enter your Proxy API Key first.'); return; }
-            try {
-                const res = await fetch('/api/maintenance', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
+            document.querySelectorAll('#navLinks li').forEach(li => {
+                li.addEventListener('click', (e) => {
+                    document.querySelectorAll('.view-container').forEach(el => el.classList.remove('active'));
+                    document.querySelectorAll('#navLinks li').forEach(el => el.classList.remove('active'));
+                    const viewName = e.currentTarget.getAttribute('data-view');
+                    document.getElementById('view-' + viewName).classList.add('active');
+                    e.currentTarget.classList.add('active');
+                    document.getElementById('view-title').innerText = titles[viewName];
                 });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || 'Failed to toggle maintenance.');
-                alert('Maintenance mode is now: ' + (json.maintenanceMode ? 'ACTIVE (Services Offline)' : 'INACTIVE (Services Online)'));
-                refreshData();
-            } catch (err) { alert('Error: ' + err.message); }
-        }
+            });
 
-        async function executeModAction(actionType) {
-            const apiKey = document.getElementById('apiKeyInput').value;
-            const channelId = document.getElementById('modChannelId').value;
-            if (!apiKey || !channelId) { alert('API Key and Target Channel ID are required.'); return; }
+            async function refreshData() {
+                const apiKey = document.getElementById('apiKeyInput').value;
+                if (!apiKey) { alert('Please enter your Proxy API Key first.'); return; }
+                try {
+                    const response = await fetch('/api/status', { headers: { 'x-api-key': apiKey } });
+                    if (!response.ok) throw new Error('Unauthorized or network exception.');
+                    const data = await response.json();
+                    document.getElementById('stat-uptime').innerText = data.uptimeSeconds + 's';
+                    document.getElementById('stat-requests').innerText = data.totalRequestsHandled;
+                    document.getElementById('stat-active').innerText = data.activeRankingOperations;
+                    
+                    const stateEl = document.getElementById('stat-state');
+                    if (data.maintenanceMode) {
+                        stateEl.innerText = 'Maintenance ⚠️'; stateEl.style.color = 'var(--warning)';
+                    } else if (data.circuitBreakerTripped) {
+                        stateEl.innerText = 'Tripped 🛑'; stateEl.style.color = 'var(--danger)';
+                    } else {
+                        stateEl.innerText = 'Optimal ✅'; stateEl.style.color = 'var(--success)';
+                    }
+                    alert('Dashboard successfully synced with backend engine!');
+                } catch (err) { alert('Sync failed: ' + err.message); }
+            }
 
-            try {
-                const res = await fetch('/api/moderation/channel', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
-                    body: JSON.stringify({ channelId, action: actionType })
-                });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || 'Failed to execute command.');
-                alert('Success: Channel command executed successfully.');
-            } catch (err) { alert('Moderation Error: ' + err.message); }
-        }
+            document.getElementById('syncBtn').addEventListener('click', refreshData);
 
-        async function executeUserModeration() {
-            const apiKey = document.getElementById('apiKeyInput').value;
-            const userId = document.getElementById('modUserId').value;
-            const action = document.getElementById('modActionType').value;
-            const reason = document.getElementById('modReason').value;
+            document.getElementById('maintBtn').addEventListener('click', async () => {
+                const apiKey = document.getElementById('apiKeyInput').value;
+                if (!apiKey) { alert('Please enter your Proxy API Key first.'); return; }
+                try {
+                    const res = await fetch('/api/maintenance', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
+                    });
+                    const json = await res.json();
+                    if (!res.ok) throw new Error(json.error || 'Failed to toggle maintenance.');
+                    alert('Maintenance mode is now: ' + (json.maintenanceMode ? 'ACTIVE (Services Offline)' : 'INACTIVE (Services Online)'));
+                    refreshData();
+                } catch (err) { alert('Error: ' + err.message); }
+            });
 
-            if (!apiKey || !userId) { alert('API Key and Target User ID are required.'); return; }
+            async function executeModAction(actionType) {
+                const apiKey = document.getElementById('apiKeyInput').value;
+                const channelId = document.getElementById('modChannelId').value;
+                if (!apiKey || !channelId) { alert('API Key and Target Channel ID are required.'); return; }
 
-            try {
-                const res = await fetch('/api/moderation/user', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
-                    body: JSON.stringify({ userId, action, reason })
-                });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || 'Failed to execute user action.');
-                alert('Success: User moderation action completed.');
-            } catch (err) { alert('Moderation Error: ' + err.message); }
-        }
+                try {
+                    const res = await fetch('/api/moderation/channel', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                        body: JSON.stringify({ channelId, action: actionType })
+                    });
+                    const json = await res.json();
+                    if (!res.ok) throw new Error(json.error || 'Failed to execute command.');
+                    alert('Success: Channel command executed successfully.');
+                } catch (err) { alert('Moderation Error: ' + err.message); }
+            }
 
-        async function sendAnnouncement() {
-            const apiKey = document.getElementById('apiKeyInput').value;
-            const channelId = document.getElementById('annChannelId').value;
-            const content = document.getElementById('annContent').value;
+            document.getElementById('modRenameBtn').addEventListener('click', () => executeModAction('rename'));
+            document.getElementById('modDeleteBtn').addEventListener('click', () => executeModAction('delete'));
 
-            if (!apiKey || !channelId || !content) { alert('All announcement fields are required.'); return; }
+            document.getElementById('execUserModBtn').addEventListener('click', async () => {
+                const apiKey = document.getElementById('apiKeyInput').value;
+                const userId = document.getElementById('modUserId').value;
+                const action = document.getElementById('modActionType').value;
+                const reason = document.getElementById('modReason').value;
 
-            try {
-                const res = await fetch('/api/moderation/announce', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
-                    body: JSON.stringify({ channelId, content })
-                });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || 'Failed to send announcement.');
-                alert('Success: Announcement posted to channel.');
-            } catch (err) { alert('Announcement Error: ' + err.message); }
-        }
+                if (!apiKey || !userId) { alert('API Key and Target User ID are required.'); return; }
+
+                try {
+                    const res = await fetch('/api/moderation/user', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                        body: JSON.stringify({ userId, action, reason })
+                    });
+                    const json = await res.json();
+                    if (!res.ok) throw new Error(json.error || 'Failed to execute user action.');
+                    alert('Success: User moderation action completed.');
+                } catch (err) { alert('Moderation Error: ' + err.message); }
+            });
+
+            document.getElementById('sendAnnBtn').addEventListener('click', async () => {
+                const apiKey = document.getElementById('apiKeyInput').value;
+                const channelId = document.getElementById('annChannelId').value;
+                const content = document.getElementById('annContent').value;
+
+                if (!apiKey || !channelId || !content) { alert('All announcement fields are required.'); return; }
+
+                try {
+                    const res = await fetch('/api/moderation/announce', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                        body: JSON.stringify({ channelId, content })
+                    });
+                    const json = await res.json();
+                    if (!res.ok) throw new Error(json.error || 'Failed to send announcement.');
+                    alert('Success: Announcement posted to channel.');
+                } catch (err) { alert('Announcement Error: ' + err.message); }
+            });
+        });
     </script>
 </body>
 </html>
