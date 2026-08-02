@@ -190,7 +190,7 @@ app.get('/', (req, res) => {
 // Main Ranking Endpoint
 app.post('/setrank', authenticateRequest, async (req, res) => {
     const { discordUserId, roleId } = req.body;
-    const cookie = process.env.ROBLOSECURITY;
+    const cookie = process.env.ROBLOX_COOKIE;
     const groupId = process.env.GROUP_ID;
     const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
     const discordServerId = process.env.DISCORD_SERVER_ID;
