@@ -41,7 +41,6 @@ const userCooldowns = new Map();
 const ticketOwners = new Map();
 const COOLDOWN_TIME = 60 * 1000;
 
-// FIFO Task Queue for Roblox API Protection
 let rankQueue = [];
 let isProcessingQueue = false;
 
@@ -237,7 +236,6 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
     return enqueueRankTask(async () => {
         systemState.activeRanks++;
         try {
-            // 1. Bloxlink Resolution Subroutine
             const bloxFetch = await fetch(`https://api.blox.link/v4/public/guilds/${CONFIG.DISCORD_SERVER_ID}/discord-to-roblox/${discordUserId}`, {
                 headers: { 'Authorization': CONFIG.BLOXLINK_API_KEY }
             });
@@ -247,7 +245,6 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
             }
             const robloxId = bloxJson.robloxID;
 
-            // 2. Group Membership Audit
             const memberFetch = await fetch(`https://groups.roblox.com/v1/groups/${CONFIG.GROUP_ID}/users/${robloxId}`);
             if (!memberFetch.ok) {
                 throw new Error('Target user is absent from the designated Roblox group structure.');
@@ -262,7 +259,6 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
                 throw new Error('Target user already possesses the precise requested rank assignment.');
             }
 
-            // 3. Dynamic CSRF Generation & Rotation Pipeline
             const authInit = await fetch('https://auth.roblox.com/v1/logout', {
                 method: 'POST',
                 headers: { 'Cookie': `.ROBLOSECURITY=${CONFIG.ROBLOSECURITY}` }
@@ -294,7 +290,6 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
                 throw new Error(`Roblox Enterprise REST Error Response: ${JSON.stringify(errorPayload)}`);
             }
 
-            // Dispatch Success Telemetry
             await dispatchWebhook({
                 title: '✅ Rank Reassignment Confirmed',
                 color: 0x2ecc71,
@@ -307,13 +302,12 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
 
             return { success: true, robloxId };
         } catch (err) {
-            // Circuit breaker trigger logic on consecutive authorization failure
             if (err.message.includes('Authentication cookie') || err.message.includes('403')) {
                 systemState.circuitBreakerOpen = true;
                 if (systemState.circuitBreakerTimeout) clearTimeout(systemState.circuitBreakerTimeout);
                 systemState.circuitBreakerTimeout = setTimeout(() => {
                     systemState.circuitBreakerOpen = false;
-                }, 300000); // 5 minute auto-reset
+                }, 300000);
             }
             throw err;
         } finally {
@@ -323,18 +317,18 @@ async function performRobloxRankingPipeline(discordUserId, roleId) {
 }
 
 // ==========================================
-// Extended API Subsystem Routes
+// API Subsystem Routes
 // ==========================================
 
 app.get('/', (req, res) => {
     res.status(200).json({ 
         architecture: 'Micro-Proxy Modular Engine',
-        version: '5.0-Enterprise',
+        version: '5.1-Enterprise-KeepAlive',
         status: systemState.circuitBreakerOpen ? 'Degraded (Circuit Open)' : 'Optimal'
     });
 });
 
-// New Advanced API: Runtime Health & Diagnostics Telemetry Feed
+// Runtime Health & Diagnostics Telemetry Feed API
 app.get('/api/status', authenticateRequest, (req, res) => {
     res.status(200).json({
         online: true,
@@ -447,6 +441,29 @@ app.post('/api/discord-interactions', verifyKeyMiddleware(CONFIG.DISCORD_PUBLIC_
         }
     }
 });
+
+// ==========================================
+// Keep-Alive Self-Ping Subsystem
+// ==========================================
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
+
+if (RENDER_EXTERNAL_URL) {
+    const PING_INTERVAL_MS = 14 * 60 * 1000; // Ping every 14 minutes
+    
+    setInterval(async () => {
+        try {
+            console.log(`⏰ [KEEP-ALIVE] Initiating self-ping heartbeat to prevent spin-down...`);
+            const response = await fetch(RENDER_EXTERNAL_URL);
+            if (response.ok) {
+                console.log(`✨ [KEEP-ALIVE] Heartbeat successful. Server is staying active.`);
+            } else {
+                console.warn(`⚠️ [KEEP-ALIVE] Heartbeat returned non-success status: ${response.status}`);
+            }
+        } catch (error) {
+            console.error(`❌ [KEEP-ALIVE] Heartbeat fetch failed:`, error.message);
+        }
+    }, PING_INTERVAL_MS);
+}
 
 app.listen(PORT, () => {
     console.log(`🔥 [ENTERPRISE CORE] V5 Advanced Proxy listening seamlessly on port ${PORT}`);
