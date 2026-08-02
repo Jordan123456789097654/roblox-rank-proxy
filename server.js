@@ -72,6 +72,7 @@ async function processQueue() {
 // Security & Core Middleware
 // ==========================================
 app.use(helmet());
+app.use(express.json());
 app.use(rateLimit({
     windowMs: 60 * 1000,
     max: 60,
@@ -95,15 +96,21 @@ const authenticateRequest = (req, res, next) => {
     next();
 };
 
-const checkMaintenance = (req, res, next) => {
+// 🛠️ Global Maintenance Enforcer: Blocks ALL /api/* routes except /api/status, /api/maintenance, and web dashboard
+const blockIfMaintenance = (req, res, next) => {
     if (systemState.maintenanceMode) {
-        return res.status(503).json({ 
-            success: false, 
-            error: 'System is currently undergoing scheduled maintenance. Services are offline.' 
-        });
+        const allowedPaths = ['/api/status', '/api/maintenance'];
+        if (!allowedPaths.includes(req.path)) {
+            return res.status(503).json({
+                success: false,
+                error: '🚫 System is locked down in MAINTENANCE MODE. All services are offline.'
+            });
+        }
     }
     next();
 };
+
+app.use(blockIfMaintenance);
 
 // ==========================================
 // Utility Subsystems
@@ -600,7 +607,7 @@ app.get('/api/status', authenticateRequest, (req, res) => {
 });
 
 // Maintenance Toggle API Endpoint
-app.post('/api/maintenance', express.json(), authenticateRequest, (req, res) => {
+app.post('/api/maintenance', authenticateRequest, (req, res) => {
     systemState.maintenanceMode = !systemState.maintenanceMode;
     console.log(`🛠️ [MAINTENANCE] System maintenance mode toggled to: ${systemState.maintenanceMode}`);
     return res.status(200).json({ success: true, maintenanceMode: systemState.maintenanceMode });
@@ -610,7 +617,7 @@ app.post('/api/maintenance', express.json(), authenticateRequest, (req, res) => 
 // Full Functional Discord Moderation API Endpoints
 // ==========================================
 
-app.post('/api/moderation/channel', express.json(), authenticateRequest, async (req, res) => {
+app.post('/api/moderation/channel', authenticateRequest, async (req, res) => {
     const { channelId, action } = req.body;
     if (!channelId || !action) {
         return res.status(400).json({ success: false, error: 'Missing channelId or action parameters.' });
@@ -640,7 +647,7 @@ app.post('/api/moderation/channel', express.json(), authenticateRequest, async (
     }
 });
 
-app.post('/api/moderation/user', express.json(), authenticateRequest, async (req, res) => {
+app.post('/api/moderation/user', authenticateRequest, async (req, res) => {
     const { userId, action, reason } = req.body;
     if (!userId || !action || !CONFIG.DISCORD_SERVER_ID) {
         return res.status(400).json({ success: false, error: 'Missing user moderation parameters.' });
@@ -677,7 +684,7 @@ app.post('/api/moderation/user', express.json(), authenticateRequest, async (req
     }
 });
 
-app.post('/api/moderation/announce', express.json(), authenticateRequest, async (req, res) => {
+app.post('/api/moderation/announce', authenticateRequest, async (req, res) => {
     const { channelId, content } = req.body;
     if (!channelId || !content) {
         return res.status(400).json({ success: false, error: 'Missing channelId or message content.' });
@@ -697,8 +704,8 @@ app.post('/api/moderation/announce', express.json(), authenticateRequest, async 
     }
 });
 
-// Primary Inbound Ranking Endpoint (Protected by Maintenance Middleware)
-app.post('/setrank', express.json(), authenticateRequest, checkMaintenance, async (req, res) => {
+// Primary Inbound Ranking Endpoint
+app.post('/setrank', authenticateRequest, async (req, res) => {
     const { discordUserId, roleId } = req.body;
     if (!discordUserId || !roleId) {
         return res.status(400).json({ success: false, error: 'Missing mandatory payload attributes: discordUserId or roleId.' });
@@ -824,5 +831,5 @@ if (RENDER_EXTERNAL_URL) {
 }
 
 app.listen(PORT, () => {
-    console.log(`🔥 [ENTERPRISE CORE] V5 Advanced Proxy with Full Mod Panel & Maintenance Switch listening on port ${PORT}`);
+    console.log(`🔥 [ENTERPRISE CORE] V5 Advanced Proxy with strict block maintenance middleware listening on port ${PORT}`);
 });
