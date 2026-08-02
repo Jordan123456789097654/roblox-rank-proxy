@@ -1,12 +1,17 @@
 {
   "name": "roblox-rank-proxy",
   "version": "1.0.0",
-  "description": "Roblox ranking proxy with Discord logging",
+  "description": "Node.js Express proxy for Roblox group ranking via BotGhost.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
