@@ -75,14 +75,12 @@ async function discordApiFetch(url, options, retries = 3) {
     throw new Error('Exceeded Discord API rate-limit retry attempts.');
 }
 
-// Advanced Error Handler: Reuses open ticket if user already has one, otherwise creates a new one
 async function handleFailureNotification(discordUserId, roleId, rawError) {
     const botToken = process.env.DISCORD_BOT_TOKEN;
     const guildId = process.env.DISCORD_SERVER_ID;
     const categoryId = process.env.ERROR_CATEGORY_ID; 
     const staffRoleId = "1529311162183975032"; 
 
-    // 1. Log failure embed to main Discord webhook
     await sendWebhook({
         title: '❌ Rank Update Failed',
         color: 0xe74c3c,
@@ -105,7 +103,6 @@ async function handleFailureNotification(discordUserId, roleId, rawError) {
     }
 
     try {
-        // 2. Fetch all channels in the server to check if an open ticket already exists for this user
         const channelsRes = await discordApiFetch(`https://discord.com/api/v10/guilds/${guildId}/channels`, {
             headers: { 'Authorization': `Bot ${botToken}` }
         });
@@ -135,10 +132,8 @@ async function handleFailureNotification(discordUserId, roleId, rawError) {
         let targetChannelId;
 
         if (existingChannel) {
-            // 3A. If channel already exists, just send a follow-up message in it instead of creating a new one
             targetChannelId = existingChannel.id;
         } else {
-            // 3B. Otherwise, create a brand-new private channel
             const createChannelRes = await discordApiFetch(`https://discord.com/api/v10/guilds/${guildId}/channels`, {
                 method: 'POST',
                 headers: {
@@ -162,7 +157,6 @@ async function handleFailureNotification(discordUserId, roleId, rawError) {
             targetChannelId = channelData.id;
         }
 
-        // 4. Send message with buttons into the channel (reused or newly created)
         await discordApiFetch(`https://discord.com/api/v10/channels/${targetChannelId}/messages`, {
             method: 'POST',
             headers: {
@@ -181,6 +175,96 @@ async function handleFailureNotification(discordUserId, roleId, rawError) {
 }
 
 // ==========================================
+// Core Ranking Execution Function (Reusable)
+// ==========================================
+async function executeRobloxRanking(discordUserId, roleId) {
+    const cookie = process.env.ROBLOX_COOKIE;
+    const groupId = process.env.GROUP_ID;
+    const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
+    const discordServerId = process.env.DISCORD_SERVER_ID;
+
+    if (!cookie || !groupId || !bloxlinkApiKey || !discordServerId) {
+        throw new Error('Server misconfiguration: Missing environment variables.');
+    }
+
+    const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
+        headers: { 'Authorization': bloxlinkApiKey }
+    });
+    
+    const bloxlinkData = await bloxlinkRes.json();
+    
+    if (!bloxlinkRes.ok || !bloxlinkData.robloxID) {
+        throw new Error('User is not verified on Bloxlink or not in the server.');
+    }
+
+    const targetRobloxId = bloxlinkData.robloxID;
+
+    const memberRes = await fetch(`https://groups.roblox.com/v1/groups/${groupId}/users/${targetRobloxId}`);
+    if (!memberRes.ok) {
+        throw new Error('User is not in the Roblox group or group data could not be fetched.');
+    }
+    const memberData = await memberRes.json();
+    
+    if (!memberData.role) {
+        throw new Error('Target user is not a member of the Roblox group.');
+    }
+
+    const targetRoleIdInt = parseInt(roleId, 10);
+
+    if (memberData.role.id === targetRoleIdInt) {
+        throw new Error('User already holds this exact rank.');
+    }
+
+    let csrfToken = null;
+    const csrfResponse = await fetch('https://auth.roblox.com/v1/logout', {
+        method: 'POST',
+        headers: { 'Cookie': `.ROBLOSECURITY=${cookie}` }
+    });
+    csrfToken = csrfResponse.headers.get('x-csrf-token');
+
+    if (!csrfToken) {
+        throw new Error('Failed to fetch initial X-CSRF-TOKEN.');
+    }
+
+    const attemptRankUpdate = async (token) => {
+        return await fetch(`https://groups.roblox.com/v1/groups/${groupId}/users/${targetRobloxId}`, {
+            method: 'PATCH',
+            headers: {
+                'Cookie': `.ROBLOSECURITY=${cookie}`,
+                'x-csrf-token': token,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ roleId: targetRoleIdInt })
+        });
+    };
+
+    let rankResponse = await attemptRankUpdate(csrfToken);
+
+    if (rankResponse.status === 403 && rankResponse.headers.has('x-csrf-token')) {
+        csrfToken = rankResponse.headers.get('x-csrf-token');
+        rankResponse = await attemptRankUpdate(csrfToken);
+    }
+
+    const responseData = await rankResponse.json().catch(() => ({}));
+
+    if (rankResponse.ok) {
+        await sendWebhook({
+            title: '✅ Rank Update Successful',
+            color: 0x2ecc71,
+            fields: [
+                { name: 'Discord User', value: `<@${discordUserId}>`, inline: true },
+                { name: 'Roblox ID', value: String(targetRobloxId), inline: true },
+                { name: 'New Role ID', value: String(roleId), inline: true }
+            ],
+            timestamp: new Date().toISOString()
+        });
+        return true;
+    }
+
+    throw new Error(JSON.stringify(responseData));
+}
+
+// ==========================================
 // Routes
 // ==========================================
 app.get('/', (req, res) => {
@@ -190,14 +274,7 @@ app.get('/', (req, res) => {
 // Main Ranking Endpoint
 app.post('/setrank', authenticateRequest, async (req, res) => {
     const { discordUserId, roleId } = req.body;
-    const cookie = process.env.ROBLOX_COOKIE;
-    const groupId = process.env.GROUP_ID;
-    const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
-    const discordServerId = process.env.DISCORD_SERVER_ID;
 
-    if (!cookie || !groupId || !bloxlinkApiKey || !discordServerId) {
-        return res.status(500).json({ error: 'Server misconfiguration: Missing environment variables.' });
-    }
     if (!discordUserId || !roleId) {
         return res.status(400).json({ error: 'Missing discordUserId or roleId in request body.' });
     }
@@ -212,85 +289,9 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
     }
     userCooldowns.set(discordUserId, now);
 
-    let targetRobloxId = null;
-
     try {
-        const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
-            headers: { 'Authorization': bloxlinkApiKey }
-        });
-        
-        const bloxlinkData = await bloxlinkRes.json();
-        
-        if (!bloxlinkRes.ok || !bloxlinkData.robloxID) {
-            throw new Error('User is not verified on Bloxlink or not in the server.');
-        }
-
-        targetRobloxId = bloxlinkData.robloxID;
-
-        const memberRes = await fetch(`https://groups.roblox.com/v1/groups/${groupId}/users/${targetRobloxId}`);
-        if (!memberRes.ok) {
-            throw new Error('User is not in the Roblox group or group data could not be fetched.');
-        }
-        const memberData = await memberRes.json();
-        
-        if (!memberData.role) {
-            throw new Error('Target user is not a member of the Roblox group.');
-        }
-
-        const targetRoleIdInt = parseInt(roleId, 10);
-
-        if (memberData.role.id === targetRoleIdInt) {
-            return res.status(400).json({ success: false, error: 'User already holds this exact rank.' });
-        }
-
-        let csrfToken = null;
-        const csrfResponse = await fetch('https://auth.roblox.com/v1/logout', {
-            method: 'POST',
-            headers: { 'Cookie': `.ROBLOSECURITY=${cookie}` }
-        });
-        csrfToken = csrfResponse.headers.get('x-csrf-token');
-
-        if (!csrfToken) {
-            throw new Error('Failed to fetch initial X-CSRF-TOKEN.');
-        }
-
-        const attemptRankUpdate = async (token) => {
-            return await fetch(`https://groups.roblox.com/v1/groups/${groupId}/users/${targetRobloxId}`, {
-                method: 'PATCH',
-                headers: {
-                    'Cookie': `.ROBLOSECURITY=${cookie}`,
-                    'x-csrf-token': token,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ roleId: targetRoleIdInt })
-            });
-        };
-
-        let rankResponse = await attemptRankUpdate(csrfToken);
-
-        if (rankResponse.status === 403 && rankResponse.headers.has('x-csrf-token')) {
-            csrfToken = rankResponse.headers.get('x-csrf-token');
-            rankResponse = await attemptRankUpdate(csrfToken);
-        }
-
-        const responseData = await rankResponse.json().catch(() => ({}));
-
-        if (rankResponse.ok) {
-            await sendWebhook({
-                title: '✅ Rank Update Successful',
-                color: 0x2ecc71,
-                fields: [
-                    { name: 'Discord User', value: `<@${discordUserId}>`, inline: true },
-                    { name: 'Roblox ID', value: String(targetRobloxId), inline: true },
-                    { name: 'New Role ID', value: String(roleId), inline: true }
-                ],
-                timestamp: new Date().toISOString()
-            });
-            return res.status(200).json({ success: true, message: 'User successfully ranked.' });
-        }
-
-        throw new Error(JSON.stringify(responseData));
-
+        await executeRobloxRanking(discordUserId, roleId);
+        return res.status(200).json({ success: true, message: 'User successfully ranked.' });
     } catch (error) {
         const errorMessage = error.message || 'Unknown error occurred';
         await handleFailureNotification(discordUserId, roleId, errorMessage);
@@ -314,6 +315,7 @@ app.post('/discord-interactions', async (req, res) => {
         const staffUserId = interaction.member.user.id;
         const botToken = process.env.DISCORD_BOT_TOKEN;
 
+        // 1. Claim Button
         if (customId.startsWith('ticket_claim_')) {
             ticketOwners.set(channelId, staffUserId);
             return res.json({
@@ -322,20 +324,97 @@ app.post('/discord-interactions', async (req, res) => {
             });
         }
 
+        // 2. Delete Button
         if (customId.startsWith('ticket_delete_')) {
-            await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
-                method: 'DELETE',
-                headers: { 'Authorization': `Bot ${botToken}` }
-            });
-            return res.json({ type: 4, data: { content: '🗑️ Deleting ticket channel...', flags: 64 } });
+            // Respond first to acknowledge, then perform async delete
+            res.json({ type: 4, data: { content: '🗑️ Deleting ticket channel...', flags: 64 } });
+            try {
+                await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bot ${botToken}` }
+                });
+            } catch (err) {
+                console.error('Failed to delete channel:', err);
+            }
+            return;
         }
 
+        // 3. Get Info Button
         if (customId.startsWith('ticket_getinfo_')) {
             const targetUser = customId.split('_')[2];
             return res.json({
                 type: 4,
-                data: { content: `📊 **Ticket Diagnostics:**\n- Target Discord User ID: \`${targetUser}\`\n- Claimed By: ${ticketOwners.get(channelId) ? `<@${ticketOwners.get(channelId)}>` : 'Unclaimed'}\n- Channel ID: \`${channelId}\``, flags: 64 }
+                data: { 
+                    content: `📊 **Ticket Diagnostics:**\n- Target Discord User ID: \`${targetUser}\`\n- Claimed By: ${ticketOwners.get(channelId) ? `<@${ticketOwners.get(channelId)}>` : 'Unclaimed'}\n- Channel ID: \`${channelId}\``, 
+                    flags: 64 
+                }
             });
+        }
+
+        // 4. Rename Button (Appends '-handled' or similar to channel)
+        if (customId.startsWith('ticket_rename_')) {
+            res.json({ type: 4, data: { content: '✏️ Renaming channel...', flags: 64 } });
+            try {
+                await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': `Bot ${botToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ name: `resolved-${channelId.slice(-4)}` })
+                });
+            } catch (err) {
+                console.error('Failed to rename channel:', err);
+            }
+            return;
+        }
+
+        // 5. Add User Button (Instructs staff how to add users)
+        if (customId.startsWith('ticket_add_')) {
+            return res.json({
+                type: 4,
+                data: { 
+                    content: `➕ To add another user or staff member to this ticket, type \`/add @username\` or modify channel permissions directly.`, 
+                    flags: 64 
+                }
+            });
+        }
+
+        // 6. Retry Rank Button (Format: ticket_retry_DISCORDID_ROLEID)
+        if (customId.startsWith('ticket_retry_')) {
+            const parts = customId.split('_');
+            const discordUserId = parts[2];
+            const roleId = parts[3];
+
+            // Acknowledge interaction immediately so Discord doesn't timeout
+            res.json({ 
+                type: 4, 
+                data: { content: `🔄 Retrying rank assignment for Role ID \`${roleId}\`... Please wait.`, flags: 64 } 
+            });
+
+            try {
+                await executeRobloxRanking(discordUserId, roleId);
+                // Send success message into the ticket channel
+                await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bot ${botToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ content: `✅ **Retry Successful!** <@${discordUserId}> has been successfully ranked. You may now close this ticket.` })
+                });
+            } catch (err) {
+                // Send failure error message into the ticket channel
+                await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bot ${botToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ content: `❌ **Retry Failed:** \`${err.message}\`` })
+                });
+            }
+            return;
         }
 
         return res.json({ type: 4, data: { content: '⚠️ Action acknowledged by proxy server.', flags: 64 } });
