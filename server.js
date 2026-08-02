@@ -38,7 +38,6 @@ const systemState = {
 };
 
 const userCooldowns = new Map();
-const ticketOwners = new Map();
 const COOLDOWN_TIME = 60 * 1000;
 
 let rankQueue = [];
@@ -126,28 +125,10 @@ async function executeDiscordApi(endpoint, options = {}, retries = 3) {
     throw new Error('Exceeded maximum retry allocations for Discord REST interaction.');
 }
 
-function buildEmbed(title, description, color = 0x3498db, ephemeral = true) {
-    return {
-        type: 4,
-        data: {
-            embeds: [{
-                title,
-                description,
-                color,
-                footer: { text: 'FreshlyPlaza Engine • Protected Proxy' },
-                timestamp: new Date().toISOString()
-            }],
-            flags: ephemeral ? 64 : 0
-        }
-    };
-}
-
 // ==========================================
-// Automated Diagnostics & Error Routing
+// Automated Diagnostics & Error Logging
 // ==========================================
 async function processFailureProtocol(discordUserId, roleId, diagnosticError) {
-    const designatedStaffRole = "1529311162183975032";
-
     await dispatchWebhook({
         title: '❌ Ranking Exception Triggered',
         color: 0xe74c3c,
@@ -157,72 +138,6 @@ async function processFailureProtocol(discordUserId, roleId, diagnosticError) {
             { name: 'Exception Stack', value: `\`\`\`json\n${String(diagnosticError).substring(0, 400)}\n\`\`\`` }
         ]
     });
-
-    if (!CONFIG.DISCORD_BOT_TOKEN || !CONFIG.DISCORD_SERVER_ID) return;
-
-    let localizedMessage = String(diagnosticError);
-    if (localizedMessage.includes('500') || localizedMessage.includes('502')) {
-        localizedMessage = 'Upstream Roblox API Gateway connectivity timeout.';
-    }
-
-    try {
-        const channelListRes = await executeDiscordApi(`/guilds/${CONFIG.DISCORD_SERVER_ID}/channels`, {
-            headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}` }
-        });
-        const channels = await channelListRes.json();
-        
-        const channelName = `rank-failed-${discordUserId.slice(-4)}`;
-        let targetChannel = channels.find(c => c.name === channelName && c.type === 0);
-        let channelId;
-
-        const rowPanel1 = {
-            type: 1, components: [
-                { type: 2, style: 1, custom_id: `ticket_claim_${discordUserId}`, label: 'Claim' },
-                { type: 2, style: 2, custom_id: `ticket_rename_${discordUserId}`, label: 'Rename' },
-                { type: 2, style: 2, custom_id: `ticket_add_${discordUserId}`, label: 'Add User' },
-                { type: 2, style: 4, custom_id: `ticket_delete_${discordUserId}`, label: 'Delete' }
-            ]
-        };
-
-        const rowPanel2 = {
-            type: 1, components: [
-                { type: 2, style: 2, custom_id: `ticket_getinfo_${discordUserId}`, label: 'Get Info' },
-                { type: 2, style: 3, custom_id: `ticket_retry_${discordUserId}_${roleId}`, label: 'Retry Rank' }
-            ]
-        };
-
-        if (targetChannel) {
-            channelId = targetChannel.id;
-        } else {
-            const newChanRes = await executeDiscordApi(`/guilds/${CONFIG.DISCORD_SERVER_ID}/channels`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    name: channelName,
-                    type: 0,
-                    parent_id: CONFIG.ERROR_CATEGORY_ID || undefined,
-                    permission_overwrites: [
-                        { id: CONFIG.DISCORD_SERVER_ID, type: 0, deny: '1024' },
-                        { id: discordUserId, type: 1, allow: '1024' },
-                        { id: designatedStaffRole, type: 0, allow: '1024' }
-                    ]
-                })
-            });
-            const channelData = await newChanRes.json();
-            channelId = channelData.id;
-        }
-
-        await executeDiscordApi(`/channels/${channelId}/messages`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                content: `<@${discordUserId}> Automated system check identified a rank execution failure for Role ID \`${roleId}\`.\n**Diagnostic Payload:** \`${localizedMessage}\``,
-                components: [rowPanel1, rowPanel2]
-            })
-        });
-    } catch (err) {
-        console.error('⚠️ [CRITICAL] Error handler execution sequence failed:', err);
-    }
 }
 
 // ==========================================
@@ -360,85 +275,6 @@ app.post('/setrank', express.json(), authenticateRequest, async (req, res) => {
     } catch (err) {
         await processFailureProtocol(discordUserId, roleId, err.message);
         return res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// ==========================================
-// Discord UI Component Interaction Controller
-// ==========================================
-app.post('/api/discord-interactions', verifyKeyMiddleware(CONFIG.DISCORD_PUBLIC_KEY), async (req, res) => {
-    const interaction = req.body;
-
-    if (interaction.type === 3) {
-        const componentId = interaction.data.custom_id;
-        const targetChannelId = interaction.channel.id;
-        const executorId = interaction.member.user.id;
-
-        try {
-            if (componentId.startsWith('ticket_claim_')) {
-                ticketOwners.set(targetChannelId, executorId);
-                return res.json(buildEmbed('🔒 Ticket Claimed', `Incident ownership successfully locked to <@${executorId}>.`, 0x3498db));
-            }
-
-            if (componentId.startsWith('ticket_getinfo_')) {
-                const targetUserSnowflake = componentId.split('_')[2];
-                const activeOwner = ticketOwners.get(targetChannelId);
-                const diagnosticInfo = `**Target Subject:** <@${targetUserSnowflake}> (\`${targetUserSnowflake}\`)\n**Owner Assigned:** ${activeOwner ? `<@${activeOwner}>` : '*None*'}\n**Channel Snowflake:** \`${targetChannelId}\``;
-                return res.json(buildEmbed('📊 Session Diagnostics', diagnosticInfo, 0x2ecc71));
-            }
-
-            if (componentId.startsWith('ticket_add_')) {
-                return res.json(buildEmbed('➕ Collaborator Control', 'Modify user permissions directly via channel overwrite controls.', 0x95a5a6));
-            }
-
-            if (componentId.startsWith('ticket_delete_')) {
-                res.json(buildEmbed('🗑️ Purge Initialized', 'Channel teardown sequence executing in 3 seconds.', 0xe74c3c));
-                setTimeout(() => {
-                    executeDiscordApi(`/channels/${targetChannelId}`, {
-                        method: 'DELETE',
-                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}` }
-                    }).catch(err => console.error('⚠️ Teardown error:', err));
-                }, 3000);
-                return;
-            }
-
-            if (componentId.startsWith('ticket_rename_')) {
-                res.json(buildEmbed('✏️ Namespace Update', 'Channel state designated as resolved.', 0xf1c40f));
-                await executeDiscordApi(`/channels/${targetChannelId}`, {
-                    method: 'PATCH',
-                    headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: `resolved-${targetChannelId.slice(-4)}` })
-                });
-                return;
-            }
-
-            if (componentId.startsWith('ticket_retry_')) {
-                const segments = componentId.split('_');
-                const discordUserId = segments[2];
-                const roleId = segments[3];
-
-                res.json(buildEmbed('🔄 Execution Retried', `Re-evaluating rank assignment sequence for <@${discordUserId}>...`, 0x3498db));
-
-                try {
-                    await performRobloxRankingPipeline(discordUserId, roleId);
-                    await executeDiscordApi(`/channels/${targetChannelId}/messages`, {
-                        method: 'POST',
-                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ embeds: [{ title: '✅ Retry Success', description: `User <@${discordUserId}> has been successfully synchronized.`, color: 0x2ecc71 }] })
-                    });
-                } catch (err) {
-                    await executeDiscordApi(`/channels/${targetChannelId}/messages`, {
-                        method: 'POST',
-                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ embeds: [{ title: '❌ Retry Blocked', description: `Exception: \`${err.message}\``, color: 0xe74c3c }] })
-                    });
-                }
-                return;
-            }
-        } catch (error) {
-            console.error('⚠️ Interaction Dispatch Exception:', error);
-            return res.json(buildEmbed('⚠️ System Error', 'An unexpected exception halted component evaluation.', 0xe74c3c));
-        }
     }
 });
 
