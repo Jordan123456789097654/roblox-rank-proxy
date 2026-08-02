@@ -1,181 +1,157 @@
-const express = require("express");
-
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ==========================================
+// Middleware & Security
+// ==========================================
+app.use(helmet()); // Secures HTTP headers
 app.use(express.json());
 
-// Load Environment Variables from Render
-const CONFIG = {
-  apiKey: process.env.ROBLOX_API_KEY,
-  groupId: process.env.GROUP_ID,
-  webhookUrl: process.env.DISCORD_WEBHOOK_URL,
-  port: process.env.PORT || 3000,
-};
+// Global Rate Limiter: Max 30 requests per minute per IP
+const limiter = rateLimit({
+    windowMs: 60 * 1000, 
+    max: 30,
+    message: { error: 'Too many requests. Please try again later.' }
+});
+app.use(limiter);
 
-// Request logger middleware
+// Custom Middleware: Request Logging
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} request to ${req.path}`);
-  next();
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    next();
 });
 
+// Custom Middleware: API Key Authentication
+const authenticateRequest = (req, res, next) => {
+    // Allows the key to be sent in headers OR the JSON body
+    const providedKey = req.headers['x-api-key'] || req.body.apiKey;
+    const expectedKey = process.env.PROXY_API_KEY;
+
+    if (!expectedKey) {
+        console.warn('⚠️ PROXY_API_KEY is not set in environment variables!');
+        return res.status(500).json({ error: 'Server misconfiguration.' });
+    }
+
+    if (providedKey !== expectedKey) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+    }
+    
+    next();
+};
+
 // ==========================================
-// DISCORD WEBHOOK LOGGING
+// Utility Functions
 // ==========================================
-async function sendDiscordLog({ success, userId, roleId, errorMessage, errorDetails }) {
-  if (!CONFIG.webhookUrl) return;
+async function sendWebhook(embed) {
+    const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) return;
 
-  // Format the error description if it's a failure
-  let embedDescription = success 
-    ? `Successfully updated user rank.` 
-    : `**Error Summary:** ${errorMessage || "An unknown error occurred during the ranking process."}`;
-
-  // Try to extract Roblox-specific error messages if available
-  if (!success && errorDetails && errorDetails.errors && errorDetails.errors.length > 0) {
-    const robloxErr = errorDetails.errors[0];
-    embedDescription += `\n**Roblox API Code:** ${robloxErr.code}\n**API Message:** ${robloxErr.message || "No specific message provided by Roblox."}`;
-  }
-
-  const embed = {
-    title: success ? "✅ Roblox Rank Updated" : "❌ Rank Update Failed",
-    description: embedDescription,
-    color: success ? 0x2ecc71 : 0xe74c3c,
-    fields: [
-      { name: "Roblox User ID", value: `\`${userId || "Unknown"}\``, inline: true },
-      { name: "Target Role ID", value: `\`${roleId || "Unknown"}\``, inline: true },
-      { name: "Group ID", value: `\`${CONFIG.groupId || "Unknown"}\``, inline: true },
-    ],
-    timestamp: new Date().toISOString(),
-    footer: { text: "Roblox Ranking Proxy Log" }
-  };
-
-  // Add raw error JSON block for debugging if it failed
-  if (!success && errorDetails) {
-    const rawErrorString = typeof errorDetails === 'string' 
-      ? errorDetails 
-      : JSON.stringify(errorDetails, null, 2);
-      
-    embed.fields.push({
-      name: "Raw API Response",
-      value: `\`\`\`json\n${rawErrorString.slice(0, 1000)}\n\`\`\``
-    });
-  }
-
-  try {
-    await fetch(CONFIG.webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ embeds: [embed] }),
-    });
-  } catch (err) {
-    console.error("[Webhook Error] Failed to send log to Discord:", err.message);
-  }
+    try {
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] })
+        });
+    } catch (error) {
+        console.error('Discord Webhook Error:', error);
+    }
 }
 
 // ==========================================
-// HEALTH & UPTIME ENDPOINTS
+// Routes
 // ==========================================
-app.get("/", (req, res) => {
-  res.status(200).json({ status: "online", message: "Roblox Rank Proxy Service Active" });
+app.get('/', (req, res) => {
+    res.status(200).json({ status: 'online', secure: true });
 });
 
-app.get("/setrank", (req, res) => {
-  res.status(200).json({ status: "ready", message: "Send a POST request with userId and roleId to rank." });
+// Main Ranking Endpoint (Protected by Authentication)
+app.post('/setrank', authenticateRequest, async (req, res) => {
+    const { userId, roleId } = req.body;
+    const cookie = process.env.ROBLOX_COOKIE;
+    const groupId = process.env.GROUP_ID;
+
+    if (!cookie || !groupId) {
+        return res.status(500).json({ error: 'Missing ROBLOX_COOKIE or GROUP_ID.' });
+    }
+    if (!userId || !roleId) {
+        return res.status(400).json({ error: 'Missing userId or roleId in request body.' });
+    }
+
+    try {
+        let csrfToken = null;
+
+        // 1. Fetch Initial CSRF Token
+        const csrfResponse = await fetch('https://auth.roblox.com/v1/logout', {
+            method: 'POST',
+            headers: { 'Cookie': `.ROBLOSECURITY=${cookie}` }
+        });
+        csrfToken = csrfResponse.headers.get('x-csrf-token');
+
+        if (!csrfToken) {
+            throw new Error('Failed to fetch initial X-CSRF-TOKEN.');
+        }
+
+        // 2. Function to attempt the rank update
+        const attemptRankUpdate = async (token) => {
+            return await fetch(`https://groups.roblox.com/v1/groups/${groupId}/users/${userId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Cookie': `.ROBLOSECURITY=${cookie}`,
+                    'x-csrf-token': token,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ roleId: parseInt(roleId, 10) })
+            });
+        };
+
+        // 3. First Attempt
+        let rankResponse = await attemptRankUpdate(csrfToken);
+
+        // 4. Retry Logic (If Roblox rejects the token, they send a new one in the headers of the 403 response)
+        if (rankResponse.status === 403 && rankResponse.headers.has('x-csrf-token')) {
+            console.log('Token rejected. Retrying with fresh token from 403 response...');
+            csrfToken = rankResponse.headers.get('x-csrf-token');
+            rankResponse = await attemptRankUpdate(csrfToken);
+        }
+
+        const responseData = await rankResponse.json().catch(() => ({}));
+
+        // 5. Handle Success
+        if (rankResponse.ok) {
+            await sendWebhook({
+                title: '✅ Rank Update Successful',
+                color: 0x2ecc71,
+                fields: [
+                    { name: 'User ID', value: String(userId), inline: true },
+                    { name: 'New Role ID', value: String(roleId), inline: true }
+                ],
+                timestamp: new Date().toISOString()
+            });
+            return res.status(200).json({ success: true, message: 'User ranked successfully.' });
+        }
+
+        // 6. Handle Failure
+        throw new Error(JSON.stringify(responseData));
+
+    } catch (error) {
+        const errorMessage = error.message || 'Unknown error occurred';
+        
+        await sendWebhook({
+            title: '❌ Rank Update Failed',
+            color: 0xe74c3c,
+            description: `Attempt to rank User ID **${userId}** failed.`,
+            fields: [{ name: 'Error', value: `\`\`\`json\n${errorMessage.substring(0, 500)}\n\`\`\`` }],
+            timestamp: new Date().toISOString()
+        });
+
+        console.error(`Rank error for User ${userId}:`, errorMessage);
+        return res.status(500).json({ success: false, error: 'Failed to rank user.' });
+    }
 });
 
-// ==========================================
-// RANK MANAGEMENT ENDPOINT
-// ==========================================
-app.post("/setrank", async (req, res) => {
-  const { userId, roleId } = req.body;
-
-  if (!CONFIG.apiKey || !CONFIG.groupId) {
-    const msg = "Missing ROBLOX_API_KEY or GROUP_ID in Render Environment Variables.";
-    console.error(`[Config Error] ${msg}`);
-    return res.status(500).json({ success: false, error: msg });
-  }
-
-  if (!userId || !roleId) {
-    const msg = "Invalid request body. 'userId' and 'roleId' are required.";
-    console.warn(`[Validation Error] ${msg}`);
-    return res.status(400).json({ success: false, error: msg });
-  }
-
-  try {
-    // 1. Fetch User Group Membership
-    const lookupUrl = `https://apis.roblox.com/cloud/v2/groups/${CONFIG.groupId}/memberships/-/users/${userId}`;
-    const lookupResponse = await fetch(lookupUrl, {
-      method: "GET",
-      headers: { "x-api-key": CONFIG.apiKey },
-    });
-
-    if (!lookupResponse.ok) {
-      let errDetail;
-      try { errDetail = await lookupResponse.json(); } 
-      catch (e) { errDetail = await lookupResponse.text(); }
-
-      const msg = `User lookup failed. They may not be in the group, or the API key lacks read permissions.`;
-      console.warn(`[Roblox Lookup Failed] User ${userId}:`, errDetail);
-      
-      await sendDiscordLog({ success: false, userId, roleId, errorMessage: msg, errorDetails: errDetail });
-      return res.status(404).json({ success: false, error: msg });
-    }
-
-    const membershipData = await lookupResponse.json();
-    const pathParts = membershipData.path ? membershipData.path.split("/") : [];
-    const membershipId = pathParts[3];
-
-    if (!membershipId) {
-      const msg = "Failed to parse user membership ID from Roblox API response.";
-      console.error(`[Parsing Error] ${msg}`, membershipData);
-      await sendDiscordLog({ success: false, userId, roleId, errorMessage: msg, errorDetails: membershipData });
-      return res.status(500).json({ success: false, error: msg });
-    }
-
-    // 2. Send PATCH Request to Update Role (Requires ?updateMask=role)
-    const updateUrl = `https://apis.roblox.com/cloud/v2/groups/${CONFIG.groupId}/memberships/${membershipId}?updateMask=role`;
-    
-    const updateResponse = await fetch(updateUrl, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.apiKey,
-      },
-      body: JSON.stringify({
-        role: `groups/${CONFIG.groupId}/roles/${roleId}`,
-      }),
-    });
-
-    if (!updateResponse.ok) {
-      let apiError;
-      try { apiError = await updateResponse.json(); } 
-      catch (e) { apiError = await updateResponse.text(); }
-
-      const msg = "Roblox API rejected the role update. Check role hierarchy and API key permissions.";
-      console.error(`[Roblox Role Update Failed] User ${userId}:`, apiError);
-      
-      await sendDiscordLog({ success: false, userId, roleId, errorMessage: msg, errorDetails: apiError });
-      return res.status(updateResponse.status).json({ success: false, error: msg, details: apiError });
-    }
-
-    // 3. Success Confirmation & Discord Log
-    console.log(`[Success] User ${userId} updated to Role ID ${roleId}`);
-    await sendDiscordLog({ success: true, userId, roleId });
-
-    return res.status(200).json({
-      success: true,
-      message: `User ${userId} successfully set to role ${roleId}`,
-    });
-
-  } catch (err) {
-    const msg = "Internal proxy server exception occurred.";
-    console.error("[Runtime Exception]", err);
-    await sendDiscordLog({ success: false, userId, roleId, errorMessage: msg, errorDetails: err.message });
-    return res.status(500).json({ success: false, error: msg, details: err.message });
-  }
-});
-
-app.listen(CONFIG.port, () => {
-  console.log(`========================================`);
-  console.log(`Proxy running on port ${CONFIG.port}`);
-  console.log(`Ready for incoming BotGhost requests.`);
-  console.log(`========================================`);
+app.listen(PORT, () => {
+    console.log(`Secure server listening on port ${PORT}`);
 });
