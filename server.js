@@ -324,9 +324,8 @@ app.post('/discord-interactions', async (req, res) => {
             });
         }
 
-        // 2. Delete Button
+        // 2. Delete Button (Acknowledge immediately)
         if (customId.startsWith('ticket_delete_')) {
-            // Respond first to acknowledge, then perform async delete
             res.json({ type: 4, data: { content: '🗑️ Deleting ticket channel...', flags: 64 } });
             try {
                 await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}`, {
@@ -351,7 +350,7 @@ app.post('/discord-interactions', async (req, res) => {
             });
         }
 
-        // 4. Rename Button (Appends '-handled' or similar to channel)
+        // 4. Rename Button (Acknowledge immediately)
         if (customId.startsWith('ticket_rename_')) {
             res.json({ type: 4, data: { content: '✏️ Renaming channel...', flags: 64 } });
             try {
@@ -369,7 +368,7 @@ app.post('/discord-interactions', async (req, res) => {
             return;
         }
 
-        // 5. Add User Button (Instructs staff how to add users)
+        // 5. Add User Button
         if (customId.startsWith('ticket_add_')) {
             return res.json({
                 type: 4,
@@ -380,13 +379,12 @@ app.post('/discord-interactions', async (req, res) => {
             });
         }
 
-        // 6. Retry Rank Button (Format: ticket_retry_DISCORDID_ROLEID)
+        // 6. Retry Rank Button (Acknowledge immediately to prevent 3-second timeout)
         if (customId.startsWith('ticket_retry_')) {
             const parts = customId.split('_');
             const discordUserId = parts[2];
             const roleId = parts[3];
 
-            // Acknowledge interaction immediately so Discord doesn't timeout
             res.json({ 
                 type: 4, 
                 data: { content: `🔄 Retrying rank assignment for Role ID \`${roleId}\`... Please wait.`, flags: 64 } 
@@ -394,7 +392,6 @@ app.post('/discord-interactions', async (req, res) => {
 
             try {
                 await executeRobloxRanking(discordUserId, roleId);
-                // Send success message into the ticket channel
                 await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
                     method: 'POST',
                     headers: {
@@ -404,7 +401,6 @@ app.post('/discord-interactions', async (req, res) => {
                     body: JSON.stringify({ content: `✅ **Retry Successful!** <@${discordUserId}> has been successfully ranked. You may now close this ticket.` })
                 });
             } catch (err) {
-                // Send failure error message into the ticket channel
                 await discordApiFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
                     method: 'POST',
                     headers: {
