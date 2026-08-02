@@ -1,6 +1,8 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const { verifyKey } = require('discord-interactions');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -301,10 +303,19 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
     }
 });
 
-// Interactive Ticket Management Button Endpoint
+// Interactive Ticket Management Button Endpoint (With Cryptographic Handshake Verification)
 app.post('/discord-interactions', async (req, res) => {
+    const signature = req.headers['x-signature-ed25519'];
+    const timestamp = req.headers['x-signature-timestamp'];
+    const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+
+    if (!PUBLIC_KEY || !verifyKey(JSON.stringify(req.body), signature, timestamp, PUBLIC_KEY)) {
+        return res.status(401).send('Invalid request signature');
+    }
+
     const interaction = req.body;
     
+    // Handles initial handshake ping from Discord portal verification check
     if (interaction.type === 1) {
         return res.json({ type: 1 });
     }
@@ -379,7 +390,7 @@ app.post('/discord-interactions', async (req, res) => {
             });
         }
 
-        // 6. Retry Rank Button (Acknowledge immediately to prevent 3-second timeout)
+        // 6. Retry Rank Button (Acknowledge immediately to avoid timeout)
         if (customId.startsWith('ticket_retry_')) {
             const parts = customId.split('_');
             const discordUserId = parts[2];
