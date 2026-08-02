@@ -1,6 +1,7 @@
 {
   "name": "roblox-rank-proxy",
   "version": "1.0.0",
+  "description": "Roblox ranking proxy with Discord logging",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
