@@ -8,43 +8,19 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 // Advanced Configuration & State
 // ==========================================
-// We cache Bloxlink requests for 5 minutes to prevent rate-limiting during high traffic
 const bloxlinkCache = new Map(); 
 const CACHE_TTL = 5 * 60 * 1000; 
 
-// ==========================================
-// Middleware & Security
-// ==========================================
-app.use(helmet()); 
-app.use(express.json());
-
-const limiter = rateLimit({
-    windowMs: 60 * 1000, 
-    max: 30,
-    message: { error: 'Too many requests. Please try again later.' }
+// Global Error Handlers (Prevents silent crashes)
+process.on('uncaughtException', (err) => {
+    console.error('🚨 [FATAL ERROR] Uncaught Exception:', err);
 });
-app.use(limiter);
-
-app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
-    next();
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 [FATAL ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-const authenticateRequest = (req, res, next) => {
-    const providedKey = req.headers['x-api-key'] || req.body.apiKey;
-    const expectedKey = process.env.PROXY_API_KEY;
-
-    if (!expectedKey) {
-        return res.status(500).json({ error: 'Server misconfiguration.' });
-    }
-    if (providedKey !== expectedKey) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
-    }
-    next();
-};
-
 // ==========================================
-// Webhook Utility
+// Webhook Logging Utility
 // ==========================================
 async function sendWebhook(embed) {
     const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
@@ -57,24 +33,77 @@ async function sendWebhook(embed) {
             body: JSON.stringify({ embeds: [embed] })
         });
     } catch (error) {
-        console.error('Webhook Error:', error.message);
+        console.error('❌ [WEBHOOK] Failed to send Discord webhook:', error.message);
     }
 }
+
+// ==========================================
+// Middleware & Security
+// ==========================================
+app.use(helmet()); 
+app.use(express.json());
+
+// 1. Log Every Incoming Connection
+app.use((req, res, next) => {
+    console.log(`\n========================================`);
+    console.log(`🌐 [NETWORK] Incoming ${req.method} request to ${req.originalUrl}`);
+    console.log(`========================================`);
+    next();
+});
+
+// 2. Rate Limiting with Deep Logging
+const limiter = rateLimit({
+    windowMs: 60 * 1000, 
+    max: 30,
+    handler: async (req, res) => {
+        console.warn(`⚠️ [RATE LIMIT] Blocked request from IP. Too many requests.`);
+        await sendWebhook({
+            title: '⏳ Rate Limit Exceeded',
+            color: 15844367, 
+            description: `A request was blocked for exceeding the rate limit.`,
+            timestamp: new Date().toISOString()
+        });
+        res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+});
+app.use(limiter);
+
+// 3. Strict Authentication with Deep Logging
+const authenticateRequest = async (req, res, next) => {
+    console.log(`🛡️ [AUTH] Verifying API Key...`);
+    const providedKey = req.headers['x-api-key'] || req.body.apiKey;
+    const expectedKey = process.env.PROXY_API_KEY;
+
+    if (!expectedKey) {
+        console.error(`🚨 [AUTH] SERVER MISCONFIGURED: PROXY_API_KEY is not set in Render environment variables!`);
+        return res.status(500).json({ error: 'Server misconfiguration.' });
+    }
+
+    if (providedKey !== expectedKey) {
+        console.warn(`🛑 [AUTH] Unauthorized Request! Provided Key: "${providedKey || 'NONE'}"`);
+        return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+    }
+
+    console.log(`✅ [AUTH] API Key validated successfully.`);
+    next();
+};
 
 // ==========================================
 // Roblox Authentication (Runs on Startup)
 // ==========================================
 async function startRoblox() {
+    console.log(`🤖 [ROBLOX] Initializing Noblox.js...`);
     const cookie = process.env.ROBLOSECURITY;
     if (!cookie) {
-        console.error("⚠️ ROBLOSECURITY cookie is missing from Environment Variables!");
+        console.error(`🚨 [ROBLOX] ROBLOSECURITY cookie is missing from Environment Variables!`);
         return;
     }
     try {
         const currentUser = await noblox.setCookie(cookie);
-        console.log(`✅ Successfully logged into Roblox as ${currentUser.UserName} (${currentUser.UserID})`);
+        console.log(`✅ [ROBLOX] Successfully logged in as: ${currentUser.UserName} (ID: ${currentUser.UserID})`);
     } catch (err) {
-        console.error("❌ Failed to log into Roblox. Is your cookie valid?", err.message);
+        console.error(`❌ [ROBLOX] Login Failed! Your cookie might be expired or invalid.`);
+        console.error(`❌ [ROBLOX] Error Details:`, err.message);
     }
 }
 startRoblox();
@@ -83,68 +112,79 @@ startRoblox();
 // Routes
 // ==========================================
 app.get('/', (req, res) => {
+    console.log(`🟢 [PING] Uptime ping received.`);
     res.status(200).json({ status: 'online', secure: true });
 });
 
 // Main Ranking Endpoint 
 app.post('/setrank', authenticateRequest, async (req, res) => {
+    console.log(`📦 [PAYLOAD] Request Body Received:`, req.body);
+
     const { discordUserId, roleId } = req.body;
     const groupId = process.env.GROUP_ID;
     const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
     const discordServerId = process.env.DISCORD_SERVER_ID;
 
+    // Validate Environment Variables
     if (!groupId || !bloxlinkApiKey || !discordServerId) {
+        console.error(`🚨 [ENV] Missing variables! Group: ${!!groupId}, Bloxlink: ${!!bloxlinkApiKey}, ServerID: ${!!discordServerId}`);
         return res.status(500).json({ error: 'Missing critical environment variables.' });
     }
+
+    // Validate Payload
     if (!discordUserId || !roleId) {
+        console.error(`⚠️ [PAYLOAD] Missing data! discordUserId: ${discordUserId}, roleId: ${roleId}`);
         return res.status(400).json({ error: 'Missing discordUserId or roleId in payload.' });
     }
 
     let targetRobloxId = null;
 
     try {
-        // 1. Advanced Bloxlink Resolution with Caching
+        console.log(`🔍 [BLOXLINK] Checking verification for Discord User: ${discordUserId}`);
         const cacheKey = `${discordServerId}-${discordUserId}`;
+
         if (bloxlinkCache.has(cacheKey) && bloxlinkCache.get(cacheKey).expires > Date.now()) {
             targetRobloxId = bloxlinkCache.get(cacheKey).robloxId;
-            console.log(`[Cache Hit] Resolved Discord ${discordUserId} to Roblox ${targetRobloxId}`);
+            console.log(`⚡ [BLOXLINK] Cache Hit! Roblox ID: ${targetRobloxId}`);
         } else {
+            console.log(`🌐 [BLOXLINK] Fetching from API...`);
             const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
                 headers: { 'Authorization': bloxlinkApiKey }
             });
             
             const bloxlinkData = await bloxlinkRes.json();
+            console.log(`📥 [BLOXLINK] API Response Status: ${bloxlinkRes.status}`);
+            console.log(`📥 [BLOXLINK] API Response Body:`, bloxlinkData);
             
             if (!bloxlinkRes.ok || !bloxlinkData.robloxID) {
-                throw new Error('User is not verified on Bloxlink or not in the server.');
+                throw new Error(`Bloxlink API Error: ${bloxlinkData.error || 'User not verified or not in server'}`);
             }
 
             targetRobloxId = bloxlinkData.robloxID;
+            console.log(`✅ [BLOXLINK] Successfully resolved Roblox ID: ${targetRobloxId}`);
             
-            // Save to cache
             bloxlinkCache.set(cacheKey, {
                 robloxId: targetRobloxId,
                 expires: Date.now() + CACHE_TTL
             });
         }
 
-        // 2. Fetch User Info for Rich Logging
+        console.log(`👤 [NOBLOX] Fetching Roblox username for ID: ${targetRobloxId}`);
         const playerInfo = await noblox.getPlayerInfo(parseInt(targetRobloxId, 10));
         const robloxUsername = playerInfo.username;
+        console.log(`👤 [NOBLOX] Username found: ${robloxUsername}`);
 
-        // 3. Execute Rank Update via Noblox (Automatically handles CSRF)
+        console.log(`⚙️ [NOBLOX] Attempting to set rank to Role ID: ${roleId}...`);
         await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), parseInt(roleId, 10));
+        console.log(`🎉 [NOBLOX] SUCCESS! Ranked ${robloxUsername} to Role ID ${roleId}`);
         
-        console.log(`✅ Successfully ranked ${robloxUsername} (${targetRobloxId}) to Role ID ${roleId}`);
-        
-        // 4. Send Success Webhook
         await sendWebhook({
-            title: '✅ Rank Update Successful',
-            color: 3066993, // Green
+            title: '🎉 Rank Update Fully Completed',
+            color: 3066993, 
             fields: [
-                { name: 'Discord User', value: `<@${discordUserId}>`, inline: true },
+                { name: 'Discord Member', value: `<@${discordUserId}>`, inline: true },
                 { name: 'Roblox Account', value: `[${robloxUsername}](https://www.roblox.com/users/${targetRobloxId}/profile)`, inline: true },
-                { name: 'New Role ID', value: `\`${roleId}\``, inline: true }
+                { name: 'Assigned Role ID', value: `\`${roleId}\``, inline: true }
             ],
             timestamp: new Date().toISOString()
         });
@@ -152,15 +192,15 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
         return res.status(200).json({ success: true, message: 'User ranked successfully.' });
 
     } catch (error) {
-        console.error(`❌ Rank error for User ${discordUserId}:`, error.message);
+        console.error(`❌ [EXECUTION ERROR] Process failed for User ${discordUserId}:`);
+        console.error(error.stack || error.message);
         
-        // Send Failure Webhook
         await sendWebhook({
-            title: '❌ Rank Update Failed',
-            color: 15158332, // Red
-            description: `Attempt to rank Discord User <@${discordUserId}> failed.`,
+            title: '❌ Rank Update Task Failed',
+            color: 15158332,
+            description: `Attempt to rank Discord User <@${discordUserId}> failed during execution.`,
             fields: [
-                { name: 'Error Reason', value: `\`\`\`\n${error.message}\n\`\`\``, inline: false }
+                { name: 'Error Message', value: `\`\`\`\n${error.message}\n\`\`\``, inline: false }
             ],
             timestamp: new Date().toISOString()
         });
@@ -169,6 +209,8 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Secure advanced server listening on port ${PORT}`);
+app.listen(PORT, async () => {
+    console.log(`========================================`);
+    console.log(`🚀 [SERVER] Host Started on Port ${PORT}`);
+    console.log(`========================================`);
 });
