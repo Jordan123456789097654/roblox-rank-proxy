@@ -44,6 +44,24 @@ const authenticateRequest = (req, res, next) => {
 };
 
 // ==========================================
+// Webhook Utility
+// ==========================================
+async function sendWebhook(embed) {
+    const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) return;
+
+    try {
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] })
+        });
+    } catch (error) {
+        console.error('Webhook Error:', error.message);
+    }
+}
+
+// ==========================================
 // Roblox Authentication (Runs on Startup)
 // ==========================================
 async function startRoblox() {
@@ -110,14 +128,43 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
             });
         }
 
-        // 2. Execute Rank Update via Noblox (Automatically handles CSRF)
+        // 2. Fetch User Info for Rich Logging
+        const playerInfo = await noblox.getPlayerInfo(parseInt(targetRobloxId, 10));
+        const robloxUsername = playerInfo.username;
+
+        // 3. Execute Rank Update via Noblox (Automatically handles CSRF)
         await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), parseInt(roleId, 10));
         
-        console.log(`✅ Successfully ranked Roblox ID ${targetRobloxId} to Role ID ${roleId}`);
+        console.log(`✅ Successfully ranked ${robloxUsername} (${targetRobloxId}) to Role ID ${roleId}`);
+        
+        // 4. Send Success Webhook
+        await sendWebhook({
+            title: '✅ Rank Update Successful',
+            color: 3066993, // Green
+            fields: [
+                { name: 'Discord User', value: `<@${discordUserId}>`, inline: true },
+                { name: 'Roblox Account', value: `[${robloxUsername}](https://www.roblox.com/users/${targetRobloxId}/profile)`, inline: true },
+                { name: 'New Role ID', value: `\`${roleId}\``, inline: true }
+            ],
+            timestamp: new Date().toISOString()
+        });
+
         return res.status(200).json({ success: true, message: 'User ranked successfully.' });
 
     } catch (error) {
         console.error(`❌ Rank error for User ${discordUserId}:`, error.message);
+        
+        // Send Failure Webhook
+        await sendWebhook({
+            title: '❌ Rank Update Failed',
+            color: 15158332, // Red
+            description: `Attempt to rank Discord User <@${discordUserId}> failed.`,
+            fields: [
+                { name: 'Error Reason', value: `\`\`\`\n${error.message}\n\`\`\``, inline: false }
+            ],
+            timestamp: new Date().toISOString()
+        });
+
         return res.status(500).json({ success: false, error: 'Failed to rank user.', details: error.message });
     }
 });
