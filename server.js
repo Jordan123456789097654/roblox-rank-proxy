@@ -1,342 +1,453 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
-const noblox = require('noblox.js'); 
-const path = require('path');
+const { verifyKeyMiddleware } = require('discord-interactions');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// Advanced Configuration & State
+// Centralized Environment Manifest
 // ==========================================
-const bloxlinkCache = new Map(); 
+const CONFIG = Object.freeze({
+    DISCORD_PUBLIC_KEY: process.env.DISCORD_PUBLIC_KEY,
+    DISCORD_BOT_TOKEN: process.env.DISCORD_BOT_TOKEN,
+    DISCORD_SERVER_ID: process.env.DISCORD_SERVER_ID,
+    DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
+    ERROR_CATEGORY_ID: process.env.ERROR_CATEGORY_ID,
+    ROBLOSECURITY: process.env.ROBLOSECURITY || process.env.ROBLOX_COOKIE,
+    GROUP_ID: process.env.GROUP_ID,
+    BLOXLINK_API_KEY: process.env.BLOXLINK_API_KEY,
+    PROXY_API_KEY: process.env.PROXY_API_KEY,
+});
 
-let proxyConfig = {
-    maintenanceMode: false,
-    statusMessage: "All systems operational.",
-    cacheTTL: 5 * 60 * 1000 // 5 minutes
+const missingKeys = Object.keys(CONFIG).filter(key => !CONFIG[key]);
+if (missingKeys.length > 0) {
+    console.error(`🚨 [CRITICAL CONFIG ERROR] Unresolved environment parameters: ${missingKeys.join(', ')}`);
+}
+
+// ==========================================
+// Advanced State Management & Async Queue
+// ==========================================
+const systemState = {
+    uptime: Date.now(),
+    requestCount: 0,
+    activeRanks: 0,
+    circuitBreakerOpen: false,
+    circuitBreakerTimeout: null
 };
 
-// Global Error Handlers to prevent container crashes
-process.on('uncaughtException', (err) => {
-    console.error('🚨 [FATAL ERROR] Uncaught Exception:', err);
-});
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('🚨 [FATAL ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
-});
+const userCooldowns = new Map();
+const ticketOwners = new Map();
+const COOLDOWN_TIME = 60 * 1000;
 
-// ==========================================
-// Advanced Webhook System
-// ==========================================
-async function sendWebhook(type, title, description, fields = []) {
-    const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-    if (!webhookUrl) return;
+// FIFO Task Queue for Roblox API Protection
+let rankQueue = [];
+let isProcessingQueue = false;
 
-    const colors = {
-        SUCCESS: 3066993,  // Green
-        ERROR: 15158332,   // Red
-        WARNING: 16776960, // Yellow
-        INFO: 3447003      // Blue
-    };
+async function enqueueRankTask(taskFn) {
+    return new Promise((resolve, reject) => {
+        rankQueue.push({ taskFn, resolve, reject });
+        processQueue();
+    });
+}
 
-    const embed = {
-        title: title,
-        description: description,
-        color: colors[type] || colors.INFO,
-        fields: fields,
-        timestamp: new Date().toISOString(),
-        footer: { text: 'Roblox Proxy System v2.0' }
-    };
+async function processQueue() {
+    if (isProcessingQueue || rankQueue.length === 0) return;
+    isProcessingQueue = true;
 
+    const { taskFn, resolve, reject } = rankQueue.shift();
     try {
-        await fetch(webhookUrl, {
+        const result = await taskFn();
+        resolve(result);
+    } catch (err) {
+        reject(err);
+    } finally {
+        isProcessingQueue = false;
+        if (rankQueue.length > 0) processQueue();
+    }
+}
+
+// ==========================================
+// Security & Core Middleware
+// ==========================================
+app.use(helmet());
+app.use(rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, error: 'Rate limit threshold exceeded.' }
+}));
+
+app.use((req, res, next) => {
+    systemState.requestCount++;
+    console.log(`🌐 [INBOUND] ${req.method} request targeting ${req.originalUrl} from ${req.ip}`);
+    next();
+});
+
+const authenticateRequest = (req, res, next) => {
+    const key = req.headers['x-api-key'] || (req.body && req.body.apiKey);
+    if (!CONFIG.PROXY_API_KEY || key !== CONFIG.PROXY_API_KEY) {
+        console.warn(`🛑 [SECURITY] Unauthorized payload signature match dropped.`);
+        return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing API key authorization header.' });
+    }
+    next();
+};
+
+// ==========================================
+// Utility Subsystems
+// ==========================================
+async function dispatchWebhook(embedPayload) {
+    if (!CONFIG.DISCORD_WEBHOOK_URL) return;
+    try {
+        await fetch(CONFIG.DISCORD_WEBHOOK_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ embeds: [embed] })
+            body: JSON.stringify({ embeds: [embedPayload] })
         });
-    } catch (error) {
-        console.error('❌ [WEBHOOK] Failed to send Discord webhook:', error.message);
-    }
-}
-
-// ==========================================
-// Middleware & Security
-// ==========================================
-app.use(helmet()); 
-app.use(express.json());
-
-// Maintenance Mode Interceptor
-app.use((req, res, next) => {
-    if (proxyConfig.maintenanceMode && req.path !== '/' && req.path !== '/health' && req.path !== '/config' && req.path !== '/dashboard') {
-        return res.status(503).json({ 
-            error: 'Proxy is currently in maintenance mode.',
-            message: proxyConfig.statusMessage 
-        });
-    }
-    next();
-});
-
-// Logging Middleware
-app.use((req, res, next) => {
-    console.log(`🌐 [NETWORK] ${req.method} request incoming to ${req.originalUrl}`);
-    next();
-});
-
-// Rate Limiting
-const limiter = rateLimit({
-    windowMs: 60 * 1000, 
-    max: 45,
-    handler: async (req, res) => {
-        console.warn(`⚠️ [RATE LIMIT] Blocked IP for excessive requests.`);
-        await sendWebhook('WARNING', '⏳ Rate Limit Exceeded', 'An IP address was throttled for exceeding request limits.');
-        res.status(429).json({ error: 'Too many requests. Please try again later.' });
-    }
-});
-app.use(limiter);
-
-// Strict Authentication Middleware
-const authenticateRequest = async (req, res, next) => {
-    const providedKey = req.headers['x-api-key'] || req.body.apiKey;
-    const expectedKey = process.env.PROXY_API_KEY;
-
-    if (!expectedKey) {
-        console.error(`🚨 [AUTH] SERVER MISCONFIGURED: PROXY_API_KEY is not set!`);
-        return res.status(500).json({ error: 'Server misconfiguration: API key not defined.' });
-    }
-
-    if (!providedKey || providedKey !== expectedKey) {
-        console.warn(`🛑 [AUTH] Unauthorized Request attempt detected.`);
-        return res.status(401).json({ error: 'Unauthorized: Invalid or missing API Key.' });
-    }
-
-    next();
-};
-
-// ==========================================
-// Roblox Authentication (Runs on Startup)
-// ==========================================
-async function startRoblox() {
-    console.log(`🤖 [ROBLOX] Initializing Noblox session...`);
-    const cookie = process.env.ROBLOSECURITY;
-    if (!cookie) {
-        console.error(`🚨 [ROBLOX] CRITICAL: ROBLOSECURITY cookie missing from environment variables!`);
-        return;
-    }
-    try {
-        const currentUser = await noblox.setCookie(cookie);
-        console.log(`✅ [ROBLOX] Authenticated successfully as: ${currentUser.UserName} (ID: ${currentUser.UserID})`);
     } catch (err) {
-        console.error(`❌ [ROBLOX] Authentication Failed! Cookie may be expired or invalid.`);
-        console.error(`❌ [ROBLOX] Details:`, err.message);
+        console.error('⚠️ [WEBHOOK ERROR] Failed to dispatch telemetry embed:', err);
     }
 }
-startRoblox();
 
-// ==========================================
-// System Routes
-// ==========================================
-app.get('/', (req, res) => {
-    res.status(200).json({ status: 'online', service: 'Roblox Management Proxy' });
-});
-
-app.get('/health', async (req, res) => {
-    try {
-        const currentUser = await noblox.getCurrentUser();
-        const memoryUsage = Math.round(process.memoryUsage().rss / 1024 / 1024);
-
-        if (!currentUser) throw new Error("Session expired.");
-
-        res.status(200).json({
-            status: 'operational',
-            robloxConnection: 'healthy',
-            botUsername: currentUser.UserName,
-            uptimeSeconds: Math.floor(process.uptime()),
-            memoryUsageMB: memoryUsage,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(503).json({
-            status: 'degraded',
-            robloxConnection: 'offline',
-            error: error.message,
-            timestamp: new Date().toISOString()
-        });
+async function executeDiscordApi(endpoint, options = {}, retries = 3) {
+    const targetUrl = endpoint.startsWith('http') ? endpoint : `https://discord.com/api/v10${endpoint}`;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        const res = await fetch(targetUrl, options);
+        if (res.status === 429) {
+            const body = await res.json().catch(() => ({}));
+            const backoff = (body.retry_after || attempt) * 1000;
+            console.warn(`⏳ [DISCORD API] Rate-limited. Sleeping execution thread for ${backoff}ms...`);
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+        }
+        return res;
     }
-});
+    throw new Error('Exceeded maximum retry allocations for Discord REST interaction.');
+}
 
-// Serve Web Dashboard
-app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(__dirname, 'dashboard.html'));
-});
-
-// Config GET & POST
-app.get('/config', authenticateRequest, (req, res) => {
-    res.status(200).json(proxyConfig);
-});
-
-app.post('/config', authenticateRequest, async (req, res) => {
-    const { maintenanceMode, statusMessage, cacheTTL } = req.body;
-
-    if (typeof maintenanceMode !== 'undefined') proxyConfig.maintenanceMode = maintenanceMode;
-    if (typeof statusMessage !== 'undefined') proxyConfig.statusMessage = statusMessage;
-    if (typeof cacheTTL !== 'undefined') proxyConfig.cacheTTL = cacheTTL;
-
-    await sendWebhook('WARNING', '🎛️ Proxy Config Updated', `**Maintenance:** ${proxyConfig.maintenanceMode}\n**Message:** ${proxyConfig.statusMessage}`);
-    res.status(200).json({ success: true, newConfig: proxyConfig });
-});
+function buildEmbed(title, description, color = 0x3498db, ephemeral = true) {
+    return {
+        type: 4,
+        data: {
+            embeds: [{
+                title,
+                description,
+                color,
+                footer: { text: 'FreshlyPlaza Engine • Protected Proxy' },
+                timestamp: new Date().toISOString()
+            }],
+            flags: ephemeral ? 64 : 0
+        }
+    };
+}
 
 // ==========================================
-// Action Endpoints
+// Automated Diagnostics & Error Routing
 // ==========================================
+async function processFailureProtocol(discordUserId, roleId, diagnosticError) {
+    const designatedStaffRole = "1529311162183975032";
 
-// 1. Set Rank via Discord ID (Bloxlink)
-app.post('/setrank', authenticateRequest, async (req, res) => {
-    let { discordUserId, rankNumber } = req.body; 
-    const groupId = process.env.GROUP_ID;
-    const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
-    const discordServerId = process.env.DISCORD_SERVER_ID;
+    await dispatchWebhook({
+        title: '❌ Ranking Exception Triggered',
+        color: 0xe74c3c,
+        description: `Operational pipeline failed to assign role parameters for user <@${discordUserId}>.`,
+        fields: [
+            { name: 'Target Role ID', value: String(roleId), inline: true },
+            { name: 'Exception Stack', value: `\`\`\`json\n${String(diagnosticError).substring(0, 400)}\n\`\`\`` }
+        ]
+    });
 
-    if (!groupId || !bloxlinkApiKey || !discordServerId) {
-        return res.status(500).json({ error: 'Missing critical environment variables on server.' });
+    if (!CONFIG.DISCORD_BOT_TOKEN || !CONFIG.DISCORD_SERVER_ID) return;
+
+    let localizedMessage = String(diagnosticError);
+    if (localizedMessage.includes('500') || localizedMessage.includes('502')) {
+        localizedMessage = 'Upstream Roblox API Gateway connectivity timeout.';
     }
-    if (!discordUserId || !rankNumber) {
-        return res.status(400).json({ error: 'Missing discordUserId or rankNumber parameters.' });
-    }
-
-    discordUserId = String(discordUserId);
 
     try {
-        let targetRobloxId = null;
-        const cacheKey = `${discordServerId}-${discordUserId}`;
+        const channelListRes = await executeDiscordApi(`/guilds/${CONFIG.DISCORD_SERVER_ID}/channels`, {
+            headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}` }
+        });
+        const channels = await channelListRes.json();
+        
+        const channelName = `rank-failed-${discordUserId.slice(-4)}`;
+        let targetChannel = channels.find(c => c.name === channelName && c.type === 0);
+        let channelId;
 
-        if (bloxlinkCache.has(cacheKey) && bloxlinkCache.get(cacheKey).expires > Date.now()) {
-            targetRobloxId = bloxlinkCache.get(cacheKey).robloxId;
+        const rowPanel1 = {
+            type: 1, components: [
+                { type: 2, style: 1, custom_id: `ticket_claim_${discordUserId}`, label: 'Claim' },
+                { type: 2, style: 2, custom_id: `ticket_rename_${discordUserId}`, label: 'Rename' },
+                { type: 2, style: 2, custom_id: `ticket_add_${discordUserId}`, label: 'Add User' },
+                { type: 2, style: 4, custom_id: `ticket_delete_${discordUserId}`, label: 'Delete' }
+            ]
+        };
+
+        const rowPanel2 = {
+            type: 1, components: [
+                { type: 2, style: 2, custom_id: `ticket_getinfo_${discordUserId}`, label: 'Get Info' },
+                { type: 2, style: 3, custom_id: `ticket_retry_${discordUserId}_${roleId}`, label: 'Retry Rank' }
+            ]
+        };
+
+        if (targetChannel) {
+            channelId = targetChannel.id;
         } else {
-            const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
-                headers: { 'Authorization': bloxlinkApiKey } 
+            const newChanRes = await executeDiscordApi(`/guilds/${CONFIG.DISCORD_SERVER_ID}/channels`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: channelName,
+                    type: 0,
+                    parent_id: CONFIG.ERROR_CATEGORY_ID || undefined,
+                    permission_overwrites: [
+                        { id: CONFIG.DISCORD_SERVER_ID, type: 0, deny: '1024' },
+                        { id: discordUserId, type: 1, allow: '1024' },
+                        { id: designatedStaffRole, type: 0, allow: '1024' }
+                    ]
+                })
             });
-            
-            if (!bloxlinkRes.ok) throw new Error(`Bloxlink API error status: ${bloxlinkRes.status}`);
-
-            const bloxlinkData = await bloxlinkRes.json();
-            if (!bloxlinkData.robloxID) throw new Error('User not verified with Bloxlink in this server.');
-
-            targetRobloxId = bloxlinkData.robloxID;
-            bloxlinkCache.set(cacheKey, { robloxId: targetRobloxId, expires: Date.now() + proxyConfig.cacheTTL });
+            const channelData = await newChanRes.json();
+            channelId = channelData.id;
         }
 
-        const playerInfo = await noblox.getPlayerInfo(parseInt(targetRobloxId, 10));
-        
-        // Smart Ranks Check
-        const botId = await noblox.getCurrentUser().then(u => u.UserID);
-        const botRank = await noblox.getRankInGroup(parseInt(groupId, 10), botId);
-        const targetCurrentRank = await noblox.getRankInGroup(parseInt(groupId, 10), parseInt(targetRobloxId, 10));
-        const desiredRank = parseInt(rankNumber, 10);
+        await executeDiscordApi(`/channels/${channelId}/messages`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                content: `<@${discordUserId}> Automated system check identified a rank execution failure for Role ID \`${roleId}\`.\n**Diagnostic Payload:** \`${localizedMessage}\``,
+                components: [rowPanel1, rowPanel2]
+            })
+        });
+    } catch (err) {
+        console.error('⚠️ [CRITICAL] Error handler execution sequence failed:', err);
+    }
+}
 
-        if (targetCurrentRank === desiredRank) {
-            return res.status(200).json({ success: true, message: 'User is already at this specific rank.' });
+// ==========================================
+// Core Mutex-Protected Ranking Engine
+// ==========================================
+async function performRobloxRankingPipeline(discordUserId, roleId) {
+    if (systemState.circuitBreakerOpen) {
+        throw new Error('Circuit breaker is currently tripped due to prior infrastructure errors. Throttling requests.');
+    }
+
+    return enqueueRankTask(async () => {
+        systemState.activeRanks++;
+        try {
+            // 1. Bloxlink Resolution Subroutine
+            const bloxFetch = await fetch(`https://api.blox.link/v4/public/guilds/${CONFIG.DISCORD_SERVER_ID}/discord-to-roblox/${discordUserId}`, {
+                headers: { 'Authorization': CONFIG.BLOXLINK_API_KEY }
+            });
+            const bloxJson = await bloxFetch.json();
+            if (!bloxFetch.ok || !bloxJson.robloxID) {
+                throw new Error('Target user is unverified on Bloxlink or missing from target guild scope.');
+            }
+            const robloxId = bloxJson.robloxID;
+
+            // 2. Group Membership Audit
+            const memberFetch = await fetch(`https://groups.roblox.com/v1/groups/${CONFIG.GROUP_ID}/users/${robloxId}`);
+            if (!memberFetch.ok) {
+                throw new Error('Target user is absent from the designated Roblox group structure.');
+            }
+            const memberJson = await memberFetch.json();
+            if (!memberJson.role) {
+                throw new Error('User maintains no valid rank baseline inside target group configuration.');
+            }
+
+            const targetRoleInt = parseInt(roleId, 10);
+            if (memberJson.role.id === targetRoleInt) {
+                throw new Error('Target user already possesses the precise requested rank assignment.');
+            }
+
+            // 3. Dynamic CSRF Generation & Rotation Pipeline
+            const authInit = await fetch('https://auth.roblox.com/v1/logout', {
+                method: 'POST',
+                headers: { 'Cookie': `.ROBLOSECURITY=${CONFIG.ROBLOSECURITY}` }
+            });
+            let csrfToken = authInit.headers.get('x-csrf-token');
+            if (!csrfToken) {
+                throw new Error('Failed to derive cryptographic X-CSRF-TOKEN. Authentication cookie may be invalid/expired.');
+            }
+
+            const dispatchPatch = async (token) => fetch(`https://groups.roblox.com/v1/groups/${CONFIG.GROUP_ID}/users/${robloxId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Cookie': `.ROBLOSECURITY=${CONFIG.ROBLOSECURITY}`,
+                    'x-csrf-token': token,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ roleId: targetRoleInt })
+            });
+
+            let patchRes = await dispatchPatch(csrfToken);
+
+            if (patchRes.status === 403 && patchRes.headers.has('x-csrf-token')) {
+                csrfToken = patchRes.headers.get('x-csrf-token');
+                patchRes = await dispatchPatch(csrfToken);
+            }
+
+            if (!patchRes.ok) {
+                const errorPayload = await patchRes.json().catch(() => ({}));
+                throw new Error(`Roblox Enterprise REST Error Response: ${JSON.stringify(errorPayload)}`);
+            }
+
+            // Dispatch Success Telemetry
+            await dispatchWebhook({
+                title: '✅ Rank Reassignment Confirmed',
+                color: 0x2ecc71,
+                fields: [
+                    { name: 'Discord Snowflake', value: `<@${discordUserId}>`, inline: true },
+                    { name: 'Roblox ID', value: String(robloxId), inline: true },
+                    { name: 'Assigned Role ID', value: String(roleId), inline: true }
+                ]
+            });
+
+            return { success: true, robloxId };
+        } catch (err) {
+            // Circuit breaker trigger logic on consecutive authorization failure
+            if (err.message.includes('Authentication cookie') || err.message.includes('403')) {
+                systemState.circuitBreakerOpen = true;
+                if (systemState.circuitBreakerTimeout) clearTimeout(systemState.circuitBreakerTimeout);
+                systemState.circuitBreakerTimeout = setTimeout(() => {
+                    systemState.circuitBreakerOpen = false;
+                }, 300000); // 5 minute auto-reset
+            }
+            throw err;
+        } finally {
+            systemState.activeRanks--;
         }
-        if (targetCurrentRank >= botRank || desiredRank >= botRank) {
-            return res.status(400).json({ error: 'Permission Error: Cannot alter ranking for users matching or exceeding bot permissions.' });
-        }
+    });
+}
 
-        await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), desiredRank);
-        
-        await sendWebhook('SUCCESS', '🎉 Rank Update Complete', null, [
-            { name: 'Discord Member', value: `<@${discordUserId}>`, inline: true },
-            { name: 'Roblox User', value: playerInfo.username, inline: true },
-            { name: 'New Rank', value: `\`${rankNumber}\``, inline: true }
-        ]);
+// ==========================================
+// Extended API Subsystem Routes
+// ==========================================
 
-        return res.status(200).json({ success: true, message: `Successfully ranked ${playerInfo.username}.` });
-    } catch (error) {
-        await sendWebhook('ERROR', '❌ Rank Modification Failed', error.message);
-        return res.status(500).json({ success: false, error: error.message });
-    }
+app.get('/', (req, res) => {
+    res.status(200).json({ 
+        architecture: 'Micro-Proxy Modular Engine',
+        version: '5.0-Enterprise',
+        status: systemState.circuitBreakerOpen ? 'Degraded (Circuit Open)' : 'Optimal'
+    });
 });
 
-// 2. Manual Set Rank via Roblox ID
-app.post('/setrank-manual', authenticateRequest, async (req, res) => {
-    const { robloxId, rankNumber } = req.body;
-    const groupId = process.env.GROUP_ID;
-
-    if (!robloxId || !rankNumber) return res.status(400).json({ error: 'Missing robloxId or rankNumber.' });
-
-    try {
-        const playerInfo = await noblox.getPlayerInfo(parseInt(robloxId, 10));
-        const botId = await noblox.getCurrentUser().then(u => u.UserID);
-        const botRank = await noblox.getRankInGroup(parseInt(groupId, 10), botId);
-        const targetCurrentRank = await noblox.getRankInGroup(parseInt(groupId, 10), parseInt(robloxId, 10));
-        const desiredRank = parseInt(rankNumber, 10);
-
-        if (targetCurrentRank === desiredRank) return res.status(200).json({ success: true, message: 'User is already at this rank.' });
-        if (targetCurrentRank >= botRank || desiredRank >= botRank) return res.status(400).json({ error: 'Permission denied by hierarchy rules.' });
-
-        await noblox.setRank(parseInt(groupId, 10), parseInt(robloxId, 10), desiredRank);
-        await sendWebhook('SUCCESS', '💻 Manual Dashboard Rank', `Ranked **${playerInfo.username}** to rank \`${rankNumber}\`.`);
-        
-        res.status(200).json({ success: true, message: `Successfully updated rank for ${playerInfo.username}.` });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+// New Advanced API: Runtime Health & Diagnostics Telemetry Feed
+app.get('/api/status', authenticateRequest, (req, res) => {
+    res.status(200).json({
+        online: true,
+        uptimeSeconds: Math.floor((Date.now() - systemState.uptime) / 1000),
+        totalRequestsHandled: systemState.requestCount,
+        activeRankingOperations: systemState.activeRanks,
+        queuedTasks: rankQueue.length,
+        circuitBreakerTripped: systemState.circuitBreakerOpen
+    });
 });
 
-// 3. Shout Endpoint
-app.post('/shout', authenticateRequest, async (req, res) => {
-    const { message } = req.body;
-    const groupId = process.env.GROUP_ID;
-
-    if (!message) return res.status(400).json({ error: 'Missing shout text content.' });
-
-    try {
-        await noblox.shout(parseInt(groupId, 10), message);
-        await sendWebhook('INFO', '📢 Group Shout Posted', `**Content:**\n${message}`);
-        res.status(200).json({ success: true, message: 'Shout updated successfully.' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 4. Exile Endpoint
-app.post('/exile', authenticateRequest, async (req, res) => {
-    const { robloxId } = req.body;
-    const groupId = process.env.GROUP_ID;
-
-    if (!robloxId) return res.status(400).json({ error: 'Missing target robloxId.' });
-
-    try {
-        await noblox.exile(parseInt(groupId, 10), parseInt(robloxId, 10));
-        await sendWebhook('WARNING', '👢 User Exiled', `Roblox ID **${robloxId}** was removed from the group.`);
-        res.status(200).json({ success: true, message: 'User exiled successfully.' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 5. Join Requests Endpoint
-app.post('/handle-join-request', authenticateRequest, async (req, res) => {
-    const { robloxId, action } = req.body; 
-    const groupId = process.env.GROUP_ID;
-
-    if (!robloxId || !['Accept', 'Decline'].includes(action)) {
-        return res.status(400).json({ error: "Invalid parameters. Action must be 'Accept' or 'Decline'." });
+// Primary Inbound Ranking Endpoint
+app.post('/setrank', express.json(), authenticateRequest, async (req, res) => {
+    const { discordUserId, roleId } = req.body;
+    if (!discordUserId || !roleId) {
+        return res.status(400).json({ success: false, error: 'Missing mandatory payload attributes: discordUserId or roleId.' });
     }
 
+    const timestampKey = userCooldowns.get(discordUserId) || 0;
+    if (Date.now() < timestampKey + COOLDOWN_TIME) {
+        const remainingWindow = Math.ceil((timestampKey + COOLDOWN_TIME - Date.now()) / 1000);
+        return res.status(429).json({ success: false, error: `Cooldown threshold active. Try again in ${remainingWindow} seconds.` });
+    }
+    userCooldowns.set(discordUserId, Date.now());
+
     try {
-        const acceptBool = action === 'Accept';
-        await noblox.handleJoinRequest(parseInt(groupId, 10), parseInt(robloxId, 10), acceptBool);
-        await sendWebhook('SUCCESS', `🚪 Join Request ${action}ed`, `Processed request for user ID: ${robloxId}`);
-        res.status(200).json({ success: true, message: `Join request successfully ${action.toLowerCase()}ed.` });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        const resolution = await performRobloxRankingPipeline(discordUserId, roleId);
+        return res.status(200).json({ success: true, data: resolution });
+    } catch (err) {
+        await processFailureProtocol(discordUserId, roleId, err.message);
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 
 // ==========================================
-// Start Server
+// Discord UI Component Interaction Controller
 // ==========================================
+app.post('/api/discord-interactions', verifyKeyMiddleware(CONFIG.DISCORD_PUBLIC_KEY), async (req, res) => {
+    const interaction = req.body;
+
+    if (interaction.type === 3) {
+        const componentId = interaction.data.custom_id;
+        const targetChannelId = interaction.channel.id;
+        const executorId = interaction.member.user.id;
+
+        try {
+            if (componentId.startsWith('ticket_claim_')) {
+                ticketOwners.set(targetChannelId, executorId);
+                return res.json(buildEmbed('🔒 Ticket Claimed', `Incident ownership successfully locked to <@${executorId}>.`, 0x3498db));
+            }
+
+            if (componentId.startsWith('ticket_getinfo_')) {
+                const targetUserSnowflake = componentId.split('_')[2];
+                const activeOwner = ticketOwners.get(targetChannelId);
+                const diagnosticInfo = `**Target Subject:** <@${targetUserSnowflake}> (\`${targetUserSnowflake}\`)\n**Owner Assigned:** ${activeOwner ? `<@${activeOwner}>` : '*None*'}\n**Channel Snowflake:** \`${targetChannelId}\``;
+                return res.json(buildEmbed('📊 Session Diagnostics', diagnosticInfo, 0x2ecc71));
+            }
+
+            if (componentId.startsWith('ticket_add_')) {
+                return res.json(buildEmbed('➕ Collaborator Control', 'Modify user permissions directly via channel overwrite controls.', 0x95a5a6));
+            }
+
+            if (componentId.startsWith('ticket_delete_')) {
+                res.json(buildEmbed('🗑️ Purge Initialized', 'Channel teardown sequence executing in 3 seconds.', 0xe74c3c));
+                setTimeout(() => {
+                    executeDiscordApi(`/channels/${targetChannelId}`, {
+                        method: 'DELETE',
+                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}` }
+                    }).catch(err => console.error('⚠️ Teardown error:', err));
+                }, 3000);
+                return;
+            }
+
+            if (componentId.startsWith('ticket_rename_')) {
+                res.json(buildEmbed('✏️ Namespace Update', 'Channel state designated as resolved.', 0xf1c40f));
+                await executeDiscordApi(`/channels/${targetChannelId}`, {
+                    method: 'PATCH',
+                    headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: `resolved-${targetChannelId.slice(-4)}` })
+                });
+                return;
+            }
+
+            if (componentId.startsWith('ticket_retry_')) {
+                const segments = componentId.split('_');
+                const discordUserId = segments[2];
+                const roleId = segments[3];
+
+                res.json(buildEmbed('🔄 Execution Retried', `Re-evaluating rank assignment sequence for <@${discordUserId}>...`, 0x3498db));
+
+                try {
+                    await performRobloxRankingPipeline(discordUserId, roleId);
+                    await executeDiscordApi(`/channels/${targetChannelId}/messages`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ embeds: [{ title: '✅ Retry Success', description: `User <@${discordUserId}> has been successfully synchronized.`, color: 0x2ecc71 }] })
+                    });
+                } catch (err) {
+                    await executeDiscordApi(`/channels/${targetChannelId}/messages`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bot ${CONFIG.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ embeds: [{ title: '❌ Retry Blocked', description: `Exception: \`${err.message}\``, color: 0xe74c3c }] })
+                    });
+                }
+                return;
+            }
+        } catch (error) {
+            console.error('⚠️ Interaction Dispatch Exception:', error);
+            return res.json(buildEmbed('⚠️ System Error', 'An unexpected exception halted component evaluation.', 0xe74c3c));
+        }
+    }
+});
+
 app.listen(PORT, () => {
-    console.log(`========================================`);
-    console.log(`🚀 [SERVER] Live and running on Port ${PORT}`);
-    console.log(`========================================`);
+    console.log(`🔥 [ENTERPRISE CORE] V5 Advanced Proxy listening seamlessly on port ${PORT}`);
 });
