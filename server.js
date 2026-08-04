@@ -11,14 +11,13 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 const bloxlinkCache = new Map(); 
 
-// Global Proxy Configuration State (Dashboard)
 let proxyConfig = {
     maintenanceMode: false,
     statusMessage: "All systems operational.",
     cacheTTL: 5 * 60 * 1000 // 5 minutes
 };
 
-// Global Error Handlers
+// Global Error Handlers to prevent container crashes
 process.on('uncaughtException', (err) => {
     console.error('🚨 [FATAL ERROR] Uncaught Exception:', err);
 });
@@ -33,7 +32,6 @@ async function sendWebhook(type, title, description, fields = []) {
     const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
     if (!webhookUrl) return;
 
-    // Define color codes based on the event type
     const colors = {
         SUCCESS: 3066993,  // Green
         ERROR: 15158332,   // Red
@@ -47,7 +45,7 @@ async function sendWebhook(type, title, description, fields = []) {
         color: colors[type] || colors.INFO,
         fields: fields,
         timestamp: new Date().toISOString(),
-        footer: { text: 'Roblox Proxy System' }
+        footer: { text: 'Roblox Proxy System v2.0' }
     };
 
     try {
@@ -69,7 +67,6 @@ app.use(express.json());
 
 // Maintenance Mode Interceptor
 app.use((req, res, next) => {
-    // Allow the ping, health, and config routes to bypass maintenance
     if (proxyConfig.maintenanceMode && req.path !== '/' && req.path !== '/health' && req.path !== '/config' && req.path !== '/dashboard') {
         return res.status(503).json({ 
             error: 'Proxy is currently in maintenance mode.',
@@ -79,43 +76,39 @@ app.use((req, res, next) => {
     next();
 });
 
-// Log Every Incoming Connection
+// Logging Middleware
 app.use((req, res, next) => {
-    console.log(`\n========================================`);
-    console.log(`🌐 [NETWORK] Incoming ${req.method} request to ${req.originalUrl}`);
-    console.log(`========================================`);
+    console.log(`🌐 [NETWORK] ${req.method} request incoming to ${req.originalUrl}`);
     next();
 });
 
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: 60 * 1000, 
-    max: 30,
+    max: 45,
     handler: async (req, res) => {
-        console.warn(`⚠️ [RATE LIMIT] Blocked request. Too many requests.`);
-        await sendWebhook('WARNING', '⏳ Rate Limit Exceeded', 'A request was blocked for exceeding the rate limit.');
+        console.warn(`⚠️ [RATE LIMIT] Blocked IP for excessive requests.`);
+        await sendWebhook('WARNING', '⏳ Rate Limit Exceeded', 'An IP address was throttled for exceeding request limits.');
         res.status(429).json({ error: 'Too many requests. Please try again later.' });
     }
 });
 app.use(limiter);
 
-// Strict Authentication
+// Strict Authentication Middleware
 const authenticateRequest = async (req, res, next) => {
-    console.log(`🛡️ [AUTH] Verifying API Key...`);
     const providedKey = req.headers['x-api-key'] || req.body.apiKey;
     const expectedKey = process.env.PROXY_API_KEY;
 
     if (!expectedKey) {
         console.error(`🚨 [AUTH] SERVER MISCONFIGURED: PROXY_API_KEY is not set!`);
-        return res.status(500).json({ error: 'Server misconfiguration.' });
+        return res.status(500).json({ error: 'Server misconfiguration: API key not defined.' });
     }
 
-    if (providedKey !== expectedKey) {
-        console.warn(`🛑 [AUTH] Unauthorized Request! Provided Key: "${providedKey || 'NONE'}"`);
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+    if (!providedKey || providedKey !== expectedKey) {
+        console.warn(`🛑 [AUTH] Unauthorized Request attempt detected.`);
+        return res.status(401).json({ error: 'Unauthorized: Invalid or missing API Key.' });
     }
 
-    console.log(`✅ [AUTH] API Key validated successfully.`);
     next();
 };
 
@@ -123,28 +116,27 @@ const authenticateRequest = async (req, res, next) => {
 // Roblox Authentication (Runs on Startup)
 // ==========================================
 async function startRoblox() {
-    console.log(`🤖 [ROBLOX] Initializing Noblox.js...`);
+    console.log(`🤖 [ROBLOX] Initializing Noblox session...`);
     const cookie = process.env.ROBLOSECURITY;
     if (!cookie) {
-        console.error(`🚨 [ROBLOX] ROBLOSECURITY cookie is missing from Environment Variables!`);
+        console.error(`🚨 [ROBLOX] CRITICAL: ROBLOSECURITY cookie missing from environment variables!`);
         return;
     }
     try {
         const currentUser = await noblox.setCookie(cookie);
-        console.log(`✅ [ROBLOX] Successfully logged in as: ${currentUser.UserName} (ID: ${currentUser.UserID})`);
+        console.log(`✅ [ROBLOX] Authenticated successfully as: ${currentUser.UserName} (ID: ${currentUser.UserID})`);
     } catch (err) {
-        console.error(`❌ [ROBLOX] Login Failed! Your cookie might be expired or IP-locked.`);
-        console.error(`❌ [ROBLOX] Error Details:`, err.message);
+        console.error(`❌ [ROBLOX] Authentication Failed! Cookie may be expired or invalid.`);
+        console.error(`❌ [ROBLOX] Details:`, err.message);
     }
 }
 startRoblox();
 
 // ==========================================
-// Utility Routes (Status, Health & Dashboard)
+// System Routes
 // ==========================================
 app.get('/', (req, res) => {
-    console.log(`🟢 [PING] Uptime ping received.`);
-    res.status(200).json({ status: 'online', secure: true });
+    res.status(200).json({ status: 'online', service: 'Roblox Management Proxy' });
 });
 
 app.get('/health', async (req, res) => {
@@ -152,7 +144,7 @@ app.get('/health', async (req, res) => {
         const currentUser = await noblox.getCurrentUser();
         const memoryUsage = Math.round(process.memoryUsage().rss / 1024 / 1024);
 
-        if (!currentUser) throw new Error("Roblox session expired or invalid.");
+        if (!currentUser) throw new Error("Session expired.");
 
         res.status(200).json({
             status: 'operational',
@@ -163,27 +155,25 @@ app.get('/health', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     } catch (error) {
-        console.error('🚨 [HEALTH CHECK] Failed:', error.message);
         res.status(503).json({
             status: 'degraded',
             robloxConnection: 'offline',
-            error: 'Bot lost connection to Roblox. Check cookie.',
+            error: error.message,
             timestamp: new Date().toISOString()
         });
     }
 });
 
-// Serve the Web Dashboard HTML file
+// Serve Web Dashboard
 app.get('/dashboard', (req, res) => {
     res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
-// 🎛️ GET: View Current Config
+// Config GET & POST
 app.get('/config', authenticateRequest, (req, res) => {
     res.status(200).json(proxyConfig);
 });
 
-// 🎛️ POST: Update Config Live
 app.post('/config', authenticateRequest, async (req, res) => {
     const { maintenanceMode, statusMessage, cacheTTL } = req.body;
 
@@ -191,202 +181,162 @@ app.post('/config', authenticateRequest, async (req, res) => {
     if (typeof statusMessage !== 'undefined') proxyConfig.statusMessage = statusMessage;
     if (typeof cacheTTL !== 'undefined') proxyConfig.cacheTTL = cacheTTL;
 
-    await sendWebhook('WARNING', '🎛️ Proxy Configuration Changed', `**Maintenance Mode:** ${proxyConfig.maintenanceMode}\n**Message:** ${proxyConfig.statusMessage}`);
-    
+    await sendWebhook('WARNING', '🎛️ Proxy Config Updated', `**Maintenance:** ${proxyConfig.maintenanceMode}\n**Message:** ${proxyConfig.statusMessage}`);
     res.status(200).json({ success: true, newConfig: proxyConfig });
 });
 
 // ==========================================
-// Main Group Management Routes
+// Action Endpoints
 // ==========================================
 
-// 📈 POST: Set Rank via Discord / Bloxlink
+// 1. Set Rank via Discord ID (Bloxlink)
 app.post('/setrank', authenticateRequest, async (req, res) => {
-    console.log(`📦 [PAYLOAD] Request Body Received:`, req.body);
-
     let { discordUserId, rankNumber } = req.body; 
     const groupId = process.env.GROUP_ID;
     const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
     const discordServerId = process.env.DISCORD_SERVER_ID;
 
     if (!groupId || !bloxlinkApiKey || !discordServerId) {
-        console.error(`🚨 [ENV] Missing variables!`);
-        return res.status(500).json({ error: 'Missing critical environment variables.' });
+        return res.status(500).json({ error: 'Missing critical environment variables on server.' });
     }
-
     if (!discordUserId || !rankNumber) {
-        return res.status(400).json({ error: 'Missing discordUserId or rankNumber in payload.' });
+        return res.status(400).json({ error: 'Missing discordUserId or rankNumber parameters.' });
     }
 
     discordUserId = String(discordUserId);
-    let targetRobloxId = null;
 
     try {
-        console.log(`🔍 [BLOXLINK] Checking verification for Discord User: ${discordUserId}`);
+        let targetRobloxId = null;
         const cacheKey = `${discordServerId}-${discordUserId}`;
 
         if (bloxlinkCache.has(cacheKey) && bloxlinkCache.get(cacheKey).expires > Date.now()) {
             targetRobloxId = bloxlinkCache.get(cacheKey).robloxId;
-            console.log(`⚡ [BLOXLINK] Cache Hit! Roblox ID: ${targetRobloxId}`);
         } else {
-            console.log(`🌐 [BLOXLINK] Fetching from API...`);
             const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
                 headers: { 'Authorization': bloxlinkApiKey } 
             });
             
-            if (!bloxlinkRes.ok) {
-                const textErr = await bloxlinkRes.text();
-                throw new Error(`Bloxlink API Error (${bloxlinkRes.status}): ${textErr}`);
-            }
+            if (!bloxlinkRes.ok) throw new Error(`Bloxlink API error status: ${bloxlinkRes.status}`);
 
             const bloxlinkData = await bloxlinkRes.json();
-            if (!bloxlinkData.robloxID) {
-                throw new Error(`Bloxlink API Error: ${bloxlinkData.error || 'User not verified or not in server'}`);
-            }
+            if (!bloxlinkData.robloxID) throw new Error('User not verified with Bloxlink in this server.');
 
             targetRobloxId = bloxlinkData.robloxID;
             bloxlinkCache.set(cacheKey, { robloxId: targetRobloxId, expires: Date.now() + proxyConfig.cacheTTL });
         }
 
         const playerInfo = await noblox.getPlayerInfo(parseInt(targetRobloxId, 10));
-        const robloxUsername = playerInfo.username;
-
-        // --- SMART RANKING ENGINE ---
-        console.log(`🧠 [SMART RANK] Running pre-checks...`);
+        
+        // Smart Ranks Check
         const botId = await noblox.getCurrentUser().then(u => u.UserID);
         const botRank = await noblox.getRankInGroup(parseInt(groupId, 10), botId);
         const targetCurrentRank = await noblox.getRankInGroup(parseInt(groupId, 10), parseInt(targetRobloxId, 10));
         const desiredRank = parseInt(rankNumber, 10);
 
         if (targetCurrentRank === desiredRank) {
-            console.log(`⚠️ [SMART RANK] Skipped. User is already Rank ${desiredRank}.`);
-            return res.status(200).json({ success: true, message: 'User is already at this rank. No action taken.' });
+            return res.status(200).json({ success: true, message: 'User is already at this specific rank.' });
+        }
+        if (targetCurrentRank >= botRank || desiredRank >= botRank) {
+            return res.status(400).json({ error: 'Permission Error: Cannot alter ranking for users matching or exceeding bot permissions.' });
         }
 
-        if (targetCurrentRank >= botRank) {
-            throw new Error(`Permission Denied: Target outranks or equals the bot (Bot: ${botRank}, Target: ${targetCurrentRank}).`);
-        }
-        if (desiredRank >= botRank) {
-            throw new Error(`Permission Denied: Cannot promote someone to a rank equal/higher than the bot.`);
-        }
-
-        console.log(`⚙️ [NOBLOX] Pre-checks passed. Executing rank change...`);
         await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), desiredRank);
-        console.log(`🎉 [NOBLOX] SUCCESS! Ranked ${robloxUsername} to Rank ${rankNumber}`);
         
-        await sendWebhook('SUCCESS', '🎉 Rank Update Fully Completed', null, [
+        await sendWebhook('SUCCESS', '🎉 Rank Update Complete', null, [
             { name: 'Discord Member', value: `<@${discordUserId}>`, inline: true },
-            { name: 'Roblox Account', value: `[${robloxUsername}](https://www.roblox.com/users/${targetRobloxId}/profile)`, inline: true },
-            { name: 'Assigned Rank Number', value: `\`${rankNumber}\``, inline: true }
+            { name: 'Roblox User', value: playerInfo.username, inline: true },
+            { name: 'New Rank', value: `\`${rankNumber}\``, inline: true }
         ]);
 
-        return res.status(200).json({ success: true, message: 'User ranked successfully.' });
-
+        return res.status(200).json({ success: true, message: `Successfully ranked ${playerInfo.username}.` });
     } catch (error) {
-        console.error(`❌ [EXECUTION ERROR] Process failed for User ${discordUserId}:`, error.message);
-        
-        await sendWebhook('ERROR', '❌ Rank Update Task Failed', `Attempt to rank Discord User <@${discordUserId}> failed.`, [
-            { name: 'Error Message', value: `\`\`\`\n${error.message}\n\`\`\``, inline: false }
-        ]);
-
-        return res.status(500).json({ success: false, error: 'Failed to rank user.', details: error.message });
+        await sendWebhook('ERROR', '❌ Rank Modification Failed', error.message);
+        return res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// 📈 POST: Set Rank Manually (For Web Dashboard - Direct Roblox ID)
+// 2. Manual Set Rank via Roblox ID
 app.post('/setrank-manual', authenticateRequest, async (req, res) => {
     const { robloxId, rankNumber } = req.body;
     const groupId = process.env.GROUP_ID;
 
-    if (!robloxId || !rankNumber) {
-        return res.status(400).json({ error: 'Missing robloxId or rankNumber.' });
-    }
+    if (!robloxId || !rankNumber) return res.status(400).json({ error: 'Missing robloxId or rankNumber.' });
 
     try {
         const playerInfo = await noblox.getPlayerInfo(parseInt(robloxId, 10));
-        
-        // Smart checks for manual web ranking
         const botId = await noblox.getCurrentUser().then(u => u.UserID);
         const botRank = await noblox.getRankInGroup(parseInt(groupId, 10), botId);
         const targetCurrentRank = await noblox.getRankInGroup(parseInt(groupId, 10), parseInt(robloxId, 10));
         const desiredRank = parseInt(rankNumber, 10);
 
-        if (targetCurrentRank === desiredRank) {
-            return res.status(200).json({ success: true, message: 'User is already at this rank.' });
-        }
-        if (targetCurrentRank >= botRank || desiredRank >= botRank) {
-            return res.status(400).json({ error: 'Permission Denied: Cannot rank user higher than or equal to the bot.' });
-        }
+        if (targetCurrentRank === desiredRank) return res.status(200).json({ success: true, message: 'User is already at this rank.' });
+        if (targetCurrentRank >= botRank || desiredRank >= botRank) return res.status(400).json({ error: 'Permission denied by hierarchy rules.' });
 
         await noblox.setRank(parseInt(groupId, 10), parseInt(robloxId, 10), desiredRank);
+        await sendWebhook('SUCCESS', '💻 Manual Dashboard Rank', `Ranked **${playerInfo.username}** to rank \`${rankNumber}\`.`);
         
-        await sendWebhook('SUCCESS', '💻 Web Dashboard Rank Update', `Manually ranked **${playerInfo.username}** to Rank \`${rankNumber}\`.`);
-        res.status(200).json({ success: true, message: `Ranked ${playerInfo.username} successfully.` });
+        res.status(200).json({ success: true, message: `Successfully updated rank for ${playerInfo.username}.` });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to rank user.', details: error.message });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// 📢 POST: Group Shout
+// 3. Shout Endpoint
 app.post('/shout', authenticateRequest, async (req, res) => {
     const { message } = req.body;
     const groupId = process.env.GROUP_ID;
 
-    if (!message) return res.status(400).json({ error: 'Missing shout message.' });
+    if (!message) return res.status(400).json({ error: 'Missing shout text content.' });
 
     try {
         await noblox.shout(parseInt(groupId, 10), message);
-        await sendWebhook('INFO', '📢 Group Shout Updated', `**New Shout:**\n${message}`);
-        res.status(200).json({ success: true, message: 'Shout posted successfully.' });
+        await sendWebhook('INFO', '📢 Group Shout Posted', `**Content:**\n${message}`);
+        res.status(200).json({ success: true, message: 'Shout updated successfully.' });
     } catch (error) {
-        await sendWebhook('ERROR', '❌ Shout Failed', error.message);
-        res.status(500).json({ error: 'Failed to post shout.' });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// 👢 POST: Exile User
+// 4. Exile Endpoint
 app.post('/exile', authenticateRequest, async (req, res) => {
     const { robloxId } = req.body;
     const groupId = process.env.GROUP_ID;
 
-    if (!robloxId) return res.status(400).json({ error: 'Missing robloxId.' });
+    if (!robloxId) return res.status(400).json({ error: 'Missing target robloxId.' });
 
     try {
         await noblox.exile(parseInt(groupId, 10), parseInt(robloxId, 10));
-        await sendWebhook('WARNING', '👢 User Exiled', `Roblox ID **${robloxId}** was exiled from the group.`);
+        await sendWebhook('WARNING', '👢 User Exiled', `Roblox ID **${robloxId}** was removed from the group.`);
         res.status(200).json({ success: true, message: 'User exiled successfully.' });
     } catch (error) {
-        await sendWebhook('ERROR', '❌ Exile Failed', error.message);
-        res.status(500).json({ error: 'Failed to exile user.' });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// 🚪 POST: Handle Join Request (Accept/Decline)
+// 5. Join Requests Endpoint
 app.post('/handle-join-request', authenticateRequest, async (req, res) => {
     const { robloxId, action } = req.body; 
     const groupId = process.env.GROUP_ID;
 
     if (!robloxId || !['Accept', 'Decline'].includes(action)) {
-        return res.status(400).json({ error: "Missing robloxId or invalid action (must be 'Accept' or 'Decline')." });
+        return res.status(400).json({ error: "Invalid parameters. Action must be 'Accept' or 'Decline'." });
     }
 
     try {
-        const actionBoolean = action === 'Accept';
-        await noblox.handleJoinRequest(parseInt(groupId, 10), parseInt(robloxId, 10), actionBoolean);
-        
-        await sendWebhook('SUCCESS', `🚪 Join Request ${action}ed`, `Processed join request for Roblox ID **${robloxId}**.`);
-        res.status(200).json({ success: true, message: `User join request ${action.toLowerCase()}ed.` });
+        const acceptBool = action === 'Accept';
+        await noblox.handleJoinRequest(parseInt(groupId, 10), parseInt(robloxId, 10), acceptBool);
+        await sendWebhook('SUCCESS', `🚪 Join Request ${action}ed`, `Processed request for user ID: ${robloxId}`);
+        res.status(200).json({ success: true, message: `Join request successfully ${action.toLowerCase()}ed.` });
     } catch (error) {
-        await sendWebhook('ERROR', '❌ Join Request Handling Failed', error.message);
-        res.status(500).json({ error: 'Failed to handle join request.' });
+        res.status(500).json({ error: error.message });
     }
 });
 
 // ==========================================
 // Start Server
 // ==========================================
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
     console.log(`========================================`);
-    console.log(`🚀 [SERVER] Host Started on Port ${PORT}`);
+    console.log(`🚀 [SERVER] Live and running on Port ${PORT}`);
     console.log(`========================================`);
 });
