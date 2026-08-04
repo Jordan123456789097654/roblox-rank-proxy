@@ -11,9 +11,10 @@ const PORT = process.env.PORT || 3000;
 const bloxlinkCache = new Map(); 
 const CACHE_TTL = 5 * 60 * 1000; 
 
-// Global Error Handlers (Prevents silent crashes)
+// Global Error Handlers
 process.on('uncaughtException', (err) => {
     console.error('🚨 [FATAL ERROR] Uncaught Exception:', err);
+    // Best practice: gracefully restart or exit here in production
 });
 process.on('unhandledRejection', (reason, promise) => {
     console.error('🚨 [FATAL ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
@@ -75,7 +76,7 @@ const authenticateRequest = async (req, res, next) => {
     const expectedKey = process.env.PROXY_API_KEY;
 
     if (!expectedKey) {
-        console.error(`🚨 [AUTH] SERVER MISCONFIGURED: PROXY_API_KEY is not set in Render environment variables!`);
+        console.error(`🚨 [AUTH] SERVER MISCONFIGURED: PROXY_API_KEY is not set!`);
         return res.status(500).json({ error: 'Server misconfiguration.' });
     }
 
@@ -102,7 +103,7 @@ async function startRoblox() {
         const currentUser = await noblox.setCookie(cookie);
         console.log(`✅ [ROBLOX] Successfully logged in as: ${currentUser.UserName} (ID: ${currentUser.UserID})`);
     } catch (err) {
-        console.error(`❌ [ROBLOX] Login Failed! Your cookie might be expired or invalid.`);
+        console.error(`❌ [ROBLOX] Login Failed! Your cookie might be expired or IP-locked.`);
         console.error(`❌ [ROBLOX] Error Details:`, err.message);
     }
 }
@@ -120,7 +121,8 @@ app.get('/', (req, res) => {
 app.post('/setrank', authenticateRequest, async (req, res) => {
     console.log(`📦 [PAYLOAD] Request Body Received:`, req.body);
 
-    const { discordUserId, roleId } = req.body;
+    // CHANGED: Renamed roleId to rankNumber to prevent confusion (see explanation below)
+    let { discordUserId, rankNumber } = req.body; 
     const groupId = process.env.GROUP_ID;
     const bloxlinkApiKey = process.env.BLOXLINK_API_KEY;
     const discordServerId = process.env.DISCORD_SERVER_ID;
@@ -132,11 +134,13 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
     }
 
     // Validate Payload
-    if (!discordUserId || !roleId) {
-        console.error(`⚠️ [PAYLOAD] Missing data! discordUserId: ${discordUserId}, roleId: ${roleId}`);
-        return res.status(400).json({ error: 'Missing discordUserId or roleId in payload.' });
+    if (!discordUserId || !rankNumber) {
+        console.error(`⚠️ [PAYLOAD] Missing data! discordUserId: ${discordUserId}, rankNumber: ${rankNumber}`);
+        return res.status(400).json({ error: 'Missing discordUserId or rankNumber in payload.' });
     }
 
+    // Ensure Discord ID is a string (prevents JS BigInt truncation)
+    discordUserId = String(discordUserId);
     let targetRobloxId = null;
 
     try {
@@ -149,14 +153,19 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
         } else {
             console.log(`🌐 [BLOXLINK] Fetching from API...`);
             const bloxlinkRes = await fetch(`https://api.blox.link/v4/public/guilds/${discordServerId}/discord-to-roblox/${discordUserId}`, {
-                headers: { 'Authorization': bloxlinkApiKey }
+                headers: { 'Authorization': bloxlinkApiKey } // Make sure your env variable DOES NOT include "Bot " or "Bearer "
             });
             
+            // Check for non-200 responses before trying to parse JSON
+            if (!bloxlinkRes.ok) {
+                const textErr = await bloxlinkRes.text();
+                throw new Error(`Bloxlink API Error (${bloxlinkRes.status}): ${textErr}`);
+            }
+
             const bloxlinkData = await bloxlinkRes.json();
-            console.log(`📥 [BLOXLINK] API Response Status: ${bloxlinkRes.status}`);
             console.log(`📥 [BLOXLINK] API Response Body:`, bloxlinkData);
             
-            if (!bloxlinkRes.ok || !bloxlinkData.robloxID) {
+            if (!bloxlinkData.robloxID) {
                 throw new Error(`Bloxlink API Error: ${bloxlinkData.error || 'User not verified or not in server'}`);
             }
 
@@ -174,9 +183,11 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
         const robloxUsername = playerInfo.username;
         console.log(`👤 [NOBLOX] Username found: ${robloxUsername}`);
 
-        console.log(`⚙️ [NOBLOX] Attempting to set rank to Role ID: ${roleId}...`);
-        await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), parseInt(roleId, 10));
-        console.log(`🎉 [NOBLOX] SUCCESS! Ranked ${robloxUsername} to Role ID ${roleId}`);
+        console.log(`⚙️ [NOBLOX] Attempting to set rank to Rank Number: ${rankNumber}...`);
+        
+        // NOBLOX REQUIRES THE 1-255 RANK NUMBER, NOT THE ROLESET ID
+        await noblox.setRank(parseInt(groupId, 10), parseInt(targetRobloxId, 10), parseInt(rankNumber, 10));
+        console.log(`🎉 [NOBLOX] SUCCESS! Ranked ${robloxUsername} to Rank ${rankNumber}`);
         
         await sendWebhook({
             title: '🎉 Rank Update Fully Completed',
@@ -184,7 +195,7 @@ app.post('/setrank', authenticateRequest, async (req, res) => {
             fields: [
                 { name: 'Discord Member', value: `<@${discordUserId}>`, inline: true },
                 { name: 'Roblox Account', value: `[${robloxUsername}](https://www.roblox.com/users/${targetRobloxId}/profile)`, inline: true },
-                { name: 'Assigned Role ID', value: `\`${roleId}\``, inline: true }
+                { name: 'Assigned Rank Number', value: `\`${rankNumber}\``, inline: true }
             ],
             timestamp: new Date().toISOString()
         });
